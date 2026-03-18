@@ -664,7 +664,7 @@ class PlaneSmoother(object):
         ndof = 0
         for p_ in closure_of_p:
             (dof, offset) = (coordinatesSection.getDof(p_), coordinatesSection.getOffset(p_))
-            bary += data[offset : offset + dof].reshape(dof, gdim).sum(axis=0)
+            bary += data[offset:offset + dof].reshape(dof, gdim).sum(axis=0)
             ndof += dof
         bary /= ndof
         return bary
@@ -701,7 +701,7 @@ class PlaneSmoother(object):
 
             def keyfunc(z):
                 coords = tuple(z[1])
-                return (coords[axis],) + tuple(coords[:axis] + coords[axis + 1 :])
+                return (coords[axis],) + tuple(coords[:axis] + coords[axis + 1:])
         else:
             minx = axis(min(entities, key=lambda z: axis(z[1]))[1])
             maxx = axis(max(entities, key=lambda z: axis(z[1]))[1])
@@ -725,8 +725,8 @@ class PlaneSmoother(object):
 
         out = []
         for k in range(ndiv):
-            out.append(entities[indices[k] : indices[k + 1]])
-        out.append(entities[indices[-1] :])
+            out.append(entities[indices[k]:indices[k + 1]])
+        out.append(entities[indices[-1]:])
 
         return out
 
