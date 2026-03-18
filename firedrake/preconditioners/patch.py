@@ -872,8 +872,8 @@ class PatchBase(PCSNESBase):
             Jhas_ext_facet_kernel = True
             Jext_facet_flops = Jext_facet_kernel.kinfo.kernel.num_flops
             ext_facet_Jop_data_args, ext_facet_Jop_map_args = make_c_arguments(J, Jext_facet_kernel, Jstate,
-                                                                                "exterior_facet",
-                                                                                require_facet_number=True)
+                                                                               "exterior_facet",
+                                                                               require_facet_number=True)
             code, Struct = make_jacobian_wrapper(ext_facet_Jop_data_args, ext_facet_Jop_map_args, Jext_facet_flops)
             ext_facet_Jop_function = load_c_function(code, "ComputeJacobian", mesh.comm)
             ext_point2facet = mesh_unique.exterior_facets.point2facetnumber.ctypes.data
@@ -920,9 +920,9 @@ class PatchBase(PCSNESBase):
                 Fhas_ext_facet_kernel = True
                 Fext_facet_flops = Fext_facet_kernel.kinfo.kernel.num_flops
                 ext_facet_Fop_data_args, ext_facet_Fop_map_args = make_c_arguments(F, Fext_facet_kernel, Fstate,
-                                                                                    "exterior_facet",
-                                                                                    require_state=True,
-                                                                                    require_facet_number=True)
+                                                                                   "exterior_facet",
+                                                                                   require_state=True,
+                                                                                   require_facet_number=True)
                 code, Struct = make_residual_wrapper(ext_facet_Fop_data_args, ext_facet_Fop_map_args, Fext_facet_flops)
                 ext_facet_Fop_function = load_c_function(code, "ComputeResidual", mesh.comm)
                 ext_point2facet = extract_unique_domain(F).exterior_facets.point2facetnumber.ctypes.data
