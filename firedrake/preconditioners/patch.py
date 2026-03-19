@@ -391,7 +391,7 @@ typedef struct {{
   const PetscInt    *point2facet;
 {};
 }} UserCtx;""".format(coeff_struct, map_struct, function)
-    call = "pyop2_call(0, npoints, whichPoints, out, {}, dofArray, {})".format(coeff_call, map_call)
+    call = "pyop2_call(0, npoints, whichPoints, out, {}, activeDofsArray, {})".format(coeff_call, map_call)
 
     return struct, call, Struct
 
@@ -413,11 +413,14 @@ PetscErrorCode ComputeResidual(PC pc,
                                const PetscInt *dofArrayWithAll,
                                void *ctx_)
 {{
-   const PetscScalar *state       = NULL;
-   const PetscInt    *whichPoints = NULL;
-   PetscScalar       *out         = NULL;
-   UserCtx           *ctx         = (UserCtx *)ctx_;
+   const PetscScalar *state          = NULL;
+   const PetscInt    *whichPoints    = NULL;
+   const PetscInt    *activeDofsArray = dofArray;
+   PetscScalar       *out            = NULL;
+   UserCtx           *ctx            = (UserCtx *)ctx_;
    PetscInt           npoints;
+   PetscInt          *filtpoints     = NULL;
+   PetscInt          *filtdofs       = NULL;
    PetscErrorCode     ierr;
    PetscFunctionBeginUser;
    ierr = ISGetSize(points, &npoints);CHKERRQ(ierr);
@@ -429,23 +432,28 @@ PetscErrorCode ComputeResidual(PC pc,
    ierr = VecGetArray(F, &out);CHKERRQ(ierr);
    ierr = ISGetIndices(points, &whichPoints);CHKERRQ(ierr);
    if (ctx->point2facet) {{
-     PetscInt *pointsArray = NULL;
-     if (npoints > 128) {{
-       ierr = PetscMalloc1(npoints, &pointsArray);CHKERRQ(ierr);
-     }} else {{
-       pointsArray = pointbuf;
-     }}
+     PetscInt nvalid = 0;
+     PetscInt tDPP   = ndof / npoints;
+     ierr = PetscMalloc1(npoints, &filtpoints);CHKERRQ(ierr);
+     if (ndof > 0) {{ ierr = PetscMalloc1(ndof, &filtdofs);CHKERRQ(ierr); }}
      for (PetscInt i = 0; i < npoints; i++) {{
-       pointsArray[i] = ctx->point2facet[whichPoints[i]];
+       PetscInt fi = ctx->point2facet[whichPoints[i]];
+       if (fi >= 0) {{
+         filtpoints[nvalid] = fi;
+         for (PetscInt d = 0; d < tDPP; d++)
+           filtdofs[nvalid * tDPP + d] = dofArray[i * tDPP + d];
+         nvalid++;
+       }}
      }}
      ierr = ISRestoreIndices(points, &whichPoints);CHKERRQ(ierr);
-     whichPoints = pointsArray;
+     npoints        = nvalid;
+     whichPoints    = filtpoints;
+     activeDofsArray = filtdofs;
    }}
-   ctx->{};
+   if (npoints) ctx->{};
    if (ctx->point2facet) {{
-     if (npoints > 128) {{
-       ierr = PetscFree(whichPoints);
-     }}
+     ierr = PetscFree(filtpoints);
+     ierr = PetscFree(filtdofs);
    }} else {{
      ierr = ISRestoreIndices(points, &whichPoints);CHKERRQ(ierr);
    }}
@@ -477,10 +485,13 @@ PetscErrorCode ComputeJacobian(PC pc,
                                const PetscInt *dofArrayWithAll,
                                void *ctx_)
 {{
-   const PetscScalar *state       = NULL;
-   const PetscInt    *whichPoints = NULL;
-   UserCtx           *ctx         = (UserCtx *)ctx_;
+   const PetscScalar *state          = NULL;
+   const PetscInt    *whichPoints    = NULL;
+   const PetscInt    *activeDofsArray = dofArray;
+   UserCtx           *ctx            = (UserCtx *)ctx_;
    PetscInt           npoints;
+   PetscInt          *filtpoints     = NULL;
+   PetscInt          *filtdofs       = NULL;
    PetscErrorCode     ierr;
    PetscFunctionBeginUser;
    ierr = ISGetSize(points, &npoints);CHKERRQ(ierr);
@@ -490,23 +501,28 @@ PetscErrorCode ComputeJacobian(PC pc,
    }}
    ierr = ISGetIndices(points, &whichPoints);CHKERRQ(ierr);
    if (ctx->point2facet) {{
-     PetscInt *pointsArray = NULL;
-     if (npoints > 128) {{
-       ierr = PetscMalloc1(npoints, &pointsArray);CHKERRQ(ierr);
-     }} else {{
-       pointsArray = pointbuf;
-     }}
+     PetscInt nvalid = 0;
+     PetscInt tDPP   = ndof / npoints;
+     ierr = PetscMalloc1(npoints, &filtpoints);CHKERRQ(ierr);
+     if (ndof > 0) {{ ierr = PetscMalloc1(ndof, &filtdofs);CHKERRQ(ierr); }}
      for (PetscInt i = 0; i < npoints; i++) {{
-       pointsArray[i] = ctx->point2facet[whichPoints[i]];
+       PetscInt fi = ctx->point2facet[whichPoints[i]];
+       if (fi >= 0) {{
+         filtpoints[nvalid] = fi;
+         for (PetscInt d = 0; d < tDPP; d++)
+           filtdofs[nvalid * tDPP + d] = dofArray[i * tDPP + d];
+         nvalid++;
+       }}
      }}
      ierr = ISRestoreIndices(points, &whichPoints);CHKERRQ(ierr);
-     whichPoints = pointsArray;
+     npoints        = nvalid;
+     whichPoints    = filtpoints;
+     activeDofsArray = filtdofs;
    }}
-   ctx->{};
+   if (npoints) ctx->{};
    if (ctx->point2facet) {{
-     if (npoints > 128) {{
-       ierr = PetscFree(whichPoints);
-     }}
+     ierr = PetscFree(filtpoints);
+     ierr = PetscFree(filtdofs);
    }} else {{
      ierr = ISRestoreIndices(points, &whichPoints);CHKERRQ(ierr);
    }}
@@ -876,7 +892,15 @@ class PatchBase(PCSNESBase):
                                                                                require_facet_number=True)
             code, Struct = make_jacobian_wrapper(ext_facet_Jop_data_args, ext_facet_Jop_map_args, Jext_facet_flops)
             ext_facet_Jop_function = load_c_function(code, "ComputeJacobian", mesh.comm)
-            ext_point2facet = mesh_unique.exterior_facets.point2facetnumber.ctypes.data
+            # Build an extended point2facetnumber covering all facet plex points so that
+            # patch-boundary interior facets (passed by PCPatch as "exterior to patch")
+            # map to -1 rather than causing an out-of-bounds access in parallel.
+            _, fEnd = mesh_unique.topology_dm.getDepthStratum(1)
+            Jext_p2f_array = numpy.full(fEnd, -1, dtype=PETSc.IntType)
+            Jext_p2f_array[mesh_unique.exterior_facets.facets] = numpy.arange(
+                len(mesh_unique.exterior_facets.facets), dtype=PETSc.IntType)
+            self.Jext_p2f_array = Jext_p2f_array  # prevent GC
+            ext_point2facet = Jext_p2f_array.ctypes.data
             ext_facet_Jop_struct = make_c_struct(ext_facet_Jop_data_args, ext_facet_Jop_map_args,
                                                  Jext_facet_kernel.funptr, Struct,
                                                  point2facet=ext_point2facet)
@@ -925,7 +949,13 @@ class PatchBase(PCSNESBase):
                                                                                    require_facet_number=True)
                 code, Struct = make_residual_wrapper(ext_facet_Fop_data_args, ext_facet_Fop_map_args, Fext_facet_flops)
                 ext_facet_Fop_function = load_c_function(code, "ComputeResidual", mesh.comm)
-                ext_point2facet = extract_unique_domain(F).exterior_facets.point2facetnumber.ctypes.data
+                ext_facet_mesh = extract_unique_domain(F)
+                _, fEnd = ext_facet_mesh.topology_dm.getDepthStratum(1)
+                Fext_p2f_array = numpy.full(fEnd, -1, dtype=PETSc.IntType)
+                Fext_p2f_array[ext_facet_mesh.exterior_facets.facets] = numpy.arange(
+                    len(ext_facet_mesh.exterior_facets.facets), dtype=PETSc.IntType)
+                self.Fext_p2f_array = Fext_p2f_array  # prevent GC
+                ext_point2facet = Fext_p2f_array.ctypes.data
                 ext_facet_Fop_struct = make_c_struct(ext_facet_Fop_data_args, ext_facet_Fop_map_args,
                                                      Fext_facet_kernel.funptr, Struct,
                                                      point2facet=ext_point2facet)
