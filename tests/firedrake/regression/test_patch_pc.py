@@ -112,7 +112,7 @@ def test_patch_pc_exterior_facets(integral_type):
         a = inner(u, v) * dx + inner(u, v) * ds
         L = inner(Constant(1.0), v) * dx
     elif integral_type == "dx_dS_and_ds":
-        a = inner(u, v) * dx + avg(u) * avg(v) * dS + inner(u, v) * ds
+        a = inner(u, v) * dx + inner(avg(u), avg(v)) * dS + inner(u, v) * ds
         L = inner(Constant(1.0), v) * dx
 
     # Solve with a direct solver for reference
