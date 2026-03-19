@@ -892,15 +892,7 @@ class PatchBase(PCSNESBase):
                                                                                require_facet_number=True)
             code, Struct = make_jacobian_wrapper(ext_facet_Jop_data_args, ext_facet_Jop_map_args, Jext_facet_flops)
             ext_facet_Jop_function = load_c_function(code, "ComputeJacobian", mesh.comm)
-            # Build an extended point2facetnumber covering all facet plex points so that
-            # patch-boundary interior facets (passed by PCPatch as "exterior to patch")
-            # map to -1 rather than causing an out-of-bounds access in parallel.
-            _, fEnd = mesh_unique.topology_dm.getDepthStratum(1)
-            Jext_p2f_array = numpy.full(fEnd, -1, dtype=PETSc.IntType)
-            Jext_p2f_array[mesh_unique.exterior_facets.facets] = numpy.arange(
-                len(mesh_unique.exterior_facets.facets), dtype=PETSc.IntType)
-            self.Jext_p2f_array = Jext_p2f_array  # prevent GC
-            ext_point2facet = Jext_p2f_array.ctypes.data
+            ext_point2facet = mesh_unique.exterior_facets.point2facetnumber.ctypes.data
             ext_facet_Jop_struct = make_c_struct(ext_facet_Jop_data_args, ext_facet_Jop_map_args,
                                                  Jext_facet_kernel.funptr, Struct,
                                                  point2facet=ext_point2facet)
@@ -949,13 +941,7 @@ class PatchBase(PCSNESBase):
                                                                                    require_facet_number=True)
                 code, Struct = make_residual_wrapper(ext_facet_Fop_data_args, ext_facet_Fop_map_args, Fext_facet_flops)
                 ext_facet_Fop_function = load_c_function(code, "ComputeResidual", mesh.comm)
-                ext_facet_mesh = extract_unique_domain(F)
-                _, fEnd = ext_facet_mesh.topology_dm.getDepthStratum(1)
-                Fext_p2f_array = numpy.full(fEnd, -1, dtype=PETSc.IntType)
-                Fext_p2f_array[ext_facet_mesh.exterior_facets.facets] = numpy.arange(
-                    len(ext_facet_mesh.exterior_facets.facets), dtype=PETSc.IntType)
-                self.Fext_p2f_array = Fext_p2f_array  # prevent GC
-                ext_point2facet = Fext_p2f_array.ctypes.data
+                ext_point2facet = extract_unique_domain(F).exterior_facets.point2facetnumber.ctypes.data
                 ext_facet_Fop_struct = make_c_struct(ext_facet_Fop_data_args, ext_facet_Fop_map_args,
                                                      Fext_facet_kernel.funptr, Struct,
                                                      point2facet=ext_point2facet)

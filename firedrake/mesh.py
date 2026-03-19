@@ -1331,7 +1331,8 @@ class MeshTopology(AbstractMeshTopology):
                                      self._cell_numbering,
                                      self.cell_closure)
 
-        point2facetnumber = np.full(facets.max(initial=0)+1, -1, dtype=IntType)
+        _, fEnd = dm.getDepthStratum(1)
+        point2facetnumber = np.full(fEnd, -1, dtype=IntType)
         point2facetnumber[facets] = np.arange(len(facets), dtype=IntType)
         obj = _Facets(self, facets, classes, set_, kind,
                       facet_cell, local_facet_number,
