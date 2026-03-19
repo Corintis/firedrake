@@ -99,6 +99,7 @@ def test_jacobi_sor_equivalence(mesh, problem_type, multiplicative):
     assert numpy.allclose(jacobi_history, patch_history)
 
 
+@pytest.mark.parallel([1, 3])
 @pytest.mark.parametrize("integral_type", ["dx_and_ds", "dx_dS_and_ds"])
 def test_patch_pc_exterior_facets(integral_type):
     """Test that PatchPC correctly handles exterior facet integrals (ds)."""
