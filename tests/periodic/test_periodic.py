@@ -25,7 +25,7 @@ def periodic_2d_mesh(request):
 def test_periodic_2d_coordinates(periodic_2d_mesh):
     """Mesh uses a DG coordinate element after loading."""
     elem = periodic_2d_mesh.ufl_coordinate_element()
-    assert "DG" in str(elem)
+    assert elem.family() == "Discontinuous Lagrange"
 
 
 def _run_periodic_helmholtz_2d_x():
@@ -78,23 +78,17 @@ def _run_periodic_helmholtz_2d_xy():
     x = SpatialCoordinate(mesh)
 
     Lx, Ly = 0.6, 0.5
-    u_exact = Function(V)
-    u_exact.interpolate(cos(2 * pi * x[0] / Lx) * cos(2 * pi * x[1] / Ly))
-
-    f_coeff = (2 * pi / Lx) ** 2 + (2 * pi / Ly) ** 2 + 1.0
-    f = Function(V).assign(f_coeff * u_exact)
+    u_exact_expr = cos(2 * pi * x[0] / Lx) * cos(2 * pi * x[1] / Ly)
 
     u = TrialFunction(V)
     v = TestFunction(V)
     a = (inner(grad(u), grad(v)) + inner(u, v)) * dx
-    L = inner(f, v) * dx
+    L = a(v, u_exact_expr)
 
     uh = Function(V)
-    solve(a == L, uh, solver_parameters={"ksp_type": "cg"})
+    solve(a == L, uh)
 
-    l2err = sqrt(assemble(inner(uh - u_exact, uh - u_exact) * dx))
-    l2norm = sqrt(assemble(inner(u_exact, u_exact) * dx))
-    assert l2err / l2norm < 0.15
+    assert errornorm(u_exact_expr, uh, "L2") / norm(u_exact_expr, "L2") < 0.15
 
 
 def test_periodic_2d_xy_solve():
@@ -109,15 +103,15 @@ def test_periodic_2d_xy_solve_parallel():
 def _run_periodic_helmholtz_3d():
     """Helmholtz on x-periodic box [0,1]^3.
 
-    Manufactured solution u_exact = cos(2*pi*x) * y*(1-y)*z*(1-z).
-    Periodic in x with non-constant boundary data, zero on y/z
-    boundaries.
+    Manufactured polynomial solution
+    u_exact = 42 + y*(1-y)*z*(1-z), periodic in x (constant in x),
+    zero on y/z boundaries.  CG4 reproduces the polynomial exactly.
     """
     mesh = Mesh(join(cwd, "geom", "p3d.msh"))
     V = FunctionSpace(mesh, "CG", 4)
     x = SpatialCoordinate(mesh)
 
-    u_exact_expr = cos(2 * pi * x[0]) * x[1] * (1 - x[1]) * x[2] * (1 - x[2])
+    u_exact_expr = 42 + x[1] * (1 - x[1]) * x[2] * (1 - x[2])
 
     u = TrialFunction(V)
     v = TestFunction(V)
@@ -125,10 +119,10 @@ def _run_periodic_helmholtz_3d():
     L = a(v, u_exact_expr)
 
     uh = Function(V)
-    bc = DirichletBC(V, Constant(0), [3, 4, 5, 6])
+    bc = DirichletBC(V, u_exact_expr, [3, 4, 5, 6])
     solve(a == L, uh, bcs=bc, solver_parameters={"ksp_type": "cg"})
 
-    assert errornorm(u_exact_expr, uh, "L2") < 1e-4
+    assert errornorm(u_exact_expr, uh, "L2") < 1e-12
 
 
 def test_periodic_3d_solve():
