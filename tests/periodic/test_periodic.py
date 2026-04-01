@@ -7,7 +7,6 @@ genuinely exercising the periodic identification.  Covers 2D and 3D
 cases.
 """
 
-import subprocess
 from math import pi
 from os.path import abspath, dirname, join
 
@@ -18,21 +17,9 @@ from firedrake import *
 cwd = abspath(dirname(__file__))
 
 
-def _generate_msh(geo_name, dim):
-    """Generate a .msh file from a .geo file using Gmsh."""
-    geo = join(cwd, "geom", f"{geo_name}.geo")
-    msh = join(cwd, "geom", f"{geo_name}.msh")
-    subprocess.check_call(
-        ["gmsh", geo, f"-{dim}", "-format", "msh2", "-o", msh],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    return msh
-
-
 @pytest.fixture(params=["p2d", "p2d_xy"])
 def periodic_2d_mesh(request):
-    msh = _generate_msh(request.param, dim=2)
-    return Mesh(msh)
+    return Mesh(join(cwd, "geom", f"{request.param}.msh"))
 
 
 def test_periodic_2d_coordinates(periodic_2d_mesh):
@@ -48,8 +35,7 @@ def test_periodic_helmholtz_2d_x():
     Manufactured solution u_exact = cos(2*pi*x/0.6) * y*(0.5 - y).
     Periodic in x with non-constant boundary data, zero on y boundaries.
     """
-    msh = _generate_msh("p2d", dim=2)
-    mesh = Mesh(msh)
+    mesh = Mesh(join(cwd, "geom", "p2d.msh"))
     V = FunctionSpace(mesh, "CG", 1)
     x = SpatialCoordinate(mesh)
 
@@ -79,8 +65,7 @@ def _run_periodic_helmholtz_2d_xy():
     Uses a wider tolerance than the other tests because the
     trigonometric solution requires fine resolution per wavelength.
     """
-    msh = _generate_msh("p2d_xy", dim=2)
-    mesh = Mesh(msh)
+    mesh = Mesh(join(cwd, "geom", "p2d_xy.msh"))
     V = FunctionSpace(mesh, "CG", 1)
     x = SpatialCoordinate(mesh)
 
@@ -114,8 +99,7 @@ def _run_periodic_helmholtz_3d():
     u_exact = 42 + y*(1-y)*z*(1-z), periodic in x (constant in x),
     zero on y/z boundaries.  CG4 reproduces the polynomial exactly.
     """
-    msh = _generate_msh("p3d", dim=3)
-    mesh = Mesh(msh)
+    mesh = Mesh(join(cwd, "geom", "p3d.msh"))
     V = FunctionSpace(mesh, "CG", 4)
     x = SpatialCoordinate(mesh)
 
