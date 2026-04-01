@@ -14,12 +14,12 @@ import pytest
 
 from firedrake import *
 
-cwd = abspath(dirname(__file__))
+meshdir = join(abspath(dirname(__file__)), '..', 'meshes')
 
 
 @pytest.fixture(params=["p2d", "p2d_xy"])
 def periodic_2d_mesh(request):
-    return Mesh(join(cwd, "geom", f"{request.param}.msh"))
+    return Mesh(join(meshdir, f"{request.param}.msh"))
 
 
 def test_periodic_2d_coordinates(periodic_2d_mesh):
@@ -35,7 +35,7 @@ def test_periodic_helmholtz_2d_x():
     Manufactured solution u_exact = cos(2*pi*x/0.6) * y*(0.5 - y).
     Periodic in x with non-constant boundary data, zero on y boundaries.
     """
-    mesh = Mesh(join(cwd, "geom", "p2d.msh"))
+    mesh = Mesh(join(meshdir, "p2d.msh"))
     V = FunctionSpace(mesh, "CG", 1)
     x = SpatialCoordinate(mesh)
 
@@ -65,7 +65,7 @@ def _run_periodic_helmholtz_2d_xy():
     Uses a wider tolerance than the other tests because the
     trigonometric solution requires fine resolution per wavelength.
     """
-    mesh = Mesh(join(cwd, "geom", "p2d_xy.msh"))
+    mesh = Mesh(join(meshdir, "p2d_xy.msh"))
     V = FunctionSpace(mesh, "CG", 1)
     x = SpatialCoordinate(mesh)
 
@@ -99,7 +99,7 @@ def _run_periodic_helmholtz_3d():
     u_exact = 42 + y*(1-y)*z*(1-z), periodic in x (constant in x),
     zero on y/z boundaries.  CG4 reproduces the polynomial exactly.
     """
-    mesh = Mesh(join(cwd, "geom", "p3d.msh"))
+    mesh = Mesh(join(meshdir, "p3d.msh"))
     V = FunctionSpace(mesh, "CG", 4)
     x = SpatialCoordinate(mesh)
 
