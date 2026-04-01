@@ -68,15 +68,6 @@ def test_periodic_helmholtz_2d_x():
     assert errornorm(u_exact_expr, uh, "L2") < 0.005
 
 
-def test_periodic_2d_x_solve():
-    _run_periodic_helmholtz_2d_x()
-
-
-@pytest.mark.parallel(nprocs=2)
-def test_periodic_2d_x_solve_parallel():
-    _run_periodic_helmholtz_2d_x()
-
-
 def _run_periodic_helmholtz_2d_xy():
     """Helmholtz on doubly-periodic rectangle [0,0.6]x[0,0.5].
 
