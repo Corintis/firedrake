@@ -41,7 +41,8 @@ def test_periodic_2d_coordinates(periodic_2d_mesh):
     assert elem.family() == "Discontinuous Lagrange"
 
 
-def _run_periodic_helmholtz_2d_x():
+@pytest.mark.parallel([1, 2])
+def test_periodic_helmholtz_2d_x():
     """Helmholtz on x-periodic rectangle [0,0.6]x[0,0.5].
 
     Manufactured solution u_exact = cos(2*pi*x/0.6) * y*(0.5 - y).
