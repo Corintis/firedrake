@@ -3190,60 +3190,32 @@ def make_mesh_from_coordinates(coordinates, name, tolerance=0.5):
     return mesh
 
 
-def _fully_localize_coordinates(dm: PETSc.DM) -> None:
-    """Expand partially localized coordinates to cover all cells.
+def _fully_localize_coordinates(dm):
+    """Expand sparsely localized coordinates to cover all cells.
 
-    By default PETSc's ``DMLocalizeCoordinates`` only creates
-    cell-local (DG) coordinates for cells that straddle the periodic
-    boundary (``sparseLocalize = True``).  Full localization of every
-    cell is possible by calling ``DMSetSparseLocalize(dm, False)``
-    before ``DMLocalizeCoordinates``, and ``createBoxMesh`` already
-    accepts a ``sparseLocalize`` flag for this purpose.
-
-    For file-based periodic meshes (e.g. Gmsh) the localization
-    happens inside ``setFromOptions`` with ``sparseLocalize = True``
-    and ``DMSetSparseLocalize`` is not yet exposed in petsc4py, so
-    this helper fills in the missing cell entries using the CG vertex
-    coordinates obtained via ``vecGetClosure``.
-
-    The Firedrake DG coordinate path in ``reordered_coords`` expects
-    every cell to have an entry in the cell coordinate vector.
-
-    .. todo::
-
-        Remove this function once petsc4py exposes
-        ``DMSetSparseLocalize``; at that point we can set
-        ``sparseLocalize = False`` before ``setFromOptions`` and let
-        PETSc handle full localization natively.
-
-    Parameters
-    ----------
-    dm : PETSc.DM
-        The DM whose cell coordinates should be fully localized.
+    For file-based periodic meshes (e.g. Gmsh), PETSc only creates
+    cell-local (DG) coordinates for cells touching the periodic
+    boundary. This fills in the remaining cells using CG vertex
+    coordinates via ``vecGetClosure``.
     """
-    if not dm.getCoordinatesLocalized():
-        return
-
     gdim = dm.getCoordinateDim()
     cStart, cEnd = dm.getHeightStratum(0)
     cell_sec = dm.getCellCoordinateSection()
-
-    dofs_per_cell = None
-    needs_expansion = False
-    for c in range(cStart, cEnd):
-        dof = cell_sec.getDof(c)
-        if dof > 0:
-            dofs_per_cell = dof
-        else:
-            needs_expansion = True
-
-    if not needs_expansion or dofs_per_cell is None:
-        return
-
     coord_sec = dm.getCoordinateSection()
     coord_vec = dm.getCoordinatesLocal()
     old_cell_vec = dm.getCellCoordinatesLocal()
 
+    # Find dofs_per_cell from an existing cell entry
+    dofs_per_cell = None
+    for c in range(cStart, cEnd):
+        dof = cell_sec.getDof(c)
+        if dof > 0:
+            dofs_per_cell = dof
+            break
+    if dofs_per_cell is None:
+        return
+
+    # Build new section and vector covering all cells
     new_sec = PETSc.Section().create(comm=PETSc.COMM_SELF)
     new_sec.setNumFields(1)
     new_sec.setFieldComponents(0, gdim)
@@ -3258,20 +3230,19 @@ def _fully_localize_coordinates(dm: PETSc.DM) -> None:
     new_vec.setType(coord_vec.getType())
 
     arr = new_vec.array
+    old_arr = old_cell_vec.array
     for c in range(cStart, cEnd):
-        new_offset = new_sec.getOffset(c)
+        off = new_sec.getOffset(c)
         old_dof = cell_sec.getDof(c)
         if old_dof > 0:
-            old_offset = cell_sec.getOffset(c)
-            arr[new_offset:new_offset + dofs_per_cell] = \
-                old_cell_vec.array[old_offset:old_offset + old_dof]
+            old_off = cell_sec.getOffset(c)
+            arr[off:off + dofs_per_cell] = old_arr[old_off:old_off + old_dof]
         else:
-            closure = dm.vecGetClosure(coord_sec, coord_vec, c)
-            arr[new_offset:new_offset + dofs_per_cell] = closure[:dofs_per_cell]
+            arr[off:off + dofs_per_cell] = dm.vecGetClosure(
+                coord_sec, coord_vec, c)[:dofs_per_cell]
 
     coord_dm = dm.getCoordinateDM()
-    new_coord_dm = coord_dm.clone()
-    dm.setCellCoordinateDM(new_coord_dm)
+    dm.setCellCoordinateDM(coord_dm.clone())
     dm.setCellCoordinateSection(gdim, new_sec)
     dm.setCellCoordinatesLocal(new_vec)
 
@@ -3297,9 +3268,15 @@ def make_mesh_from_mesh_topology(topology, name, tolerance=0.5):
     # Construct coordinate element
     # TODO: meshfile might indicates higher-order coordinate element
     cell = topology.ufl_cell()
-    geometric_dim = topology.topology_dm.getCoordinateDim()
-    _fully_localize_coordinates(topology.topology_dm)
-    if not topology.topology_dm.getCoordinatesLocalized():
+    dm = topology.topology_dm
+    geometric_dim = dm.getCoordinateDim()
+    # For periodic meshes loaded from file (e.g. Gmsh), PETSc creates
+    # cell-local (DG) coordinates only for cells touching the periodic
+    # boundary (sparse localization). Firedrake needs every cell to
+    # have an entry, so we expand to full localization.
+    if dm.getCoordinatesLocalized():
+        _fully_localize_coordinates(dm)
+    if not dm.getCoordinatesLocalized():
         element = finat.ufl.VectorElement("Lagrange", cell, 1, dim=geometric_dim)
     else:
         element = finat.ufl.VectorElement("DQ" if cell in [ufl.quadrilateral, ufl.hexahedron] else "DG", cell, 1, dim=geometric_dim, variant="equispaced")
