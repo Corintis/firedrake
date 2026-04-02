@@ -68,6 +68,7 @@ def test_periodic_helmholtz_2d_x():
 
     assert errornorm(u_exact_expr, uh, "L2") < 0.005
 
+
 @pytest.mark.parallel([1, 2])
 def test_periodic_2d_xy_solve():
     """Helmholtz on doubly-periodic rectangle [0,0.6]x[0,0.5].
@@ -98,8 +99,6 @@ def test_periodic_2d_xy_solve():
     assert errornorm(u_exact_expr, uh, "L2") / norm(u_exact_expr, "L2") < 0.15
 
 
-
-
 @pytest.mark.parallel([1, 2])
 def test_periodic_3d_solve():
     """Helmholtz on x-periodic box [0,1]^3.
@@ -124,5 +123,3 @@ def test_periodic_3d_solve():
     solve(a == L, uh, bcs=bc, solver_parameters={"ksp_type": "cg"})
 
     assert errornorm(u_exact_expr, uh, "L2") < 1e-12
-
-
