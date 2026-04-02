@@ -68,8 +68,8 @@ def test_periodic_helmholtz_2d_x():
 
     assert errornorm(u_exact_expr, uh, "L2") < 0.005
 
-
-def _run_periodic_helmholtz_2d_xy():
+@pytest.mark.parallel([1, 2])
+def test_periodic_2d_xy_solve():
     """Helmholtz on doubly-periodic rectangle [0,0.6]x[0,0.5].
 
     Trigonometric manufactured solution
@@ -98,16 +98,10 @@ def _run_periodic_helmholtz_2d_xy():
     assert errornorm(u_exact_expr, uh, "L2") / norm(u_exact_expr, "L2") < 0.15
 
 
-def test_periodic_2d_xy_solve():
-    _run_periodic_helmholtz_2d_xy()
 
 
-@pytest.mark.parallel(nprocs=2)
-def test_periodic_2d_xy_solve_parallel():
-    _run_periodic_helmholtz_2d_xy()
-
-
-def _run_periodic_helmholtz_3d():
+@pytest.mark.parallel([1, 2])
+def test_periodic_3d_solve():
     """Helmholtz on x-periodic box [0,1]^3.
 
     Manufactured polynomial solution
@@ -132,10 +126,3 @@ def _run_periodic_helmholtz_3d():
     assert errornorm(u_exact_expr, uh, "L2") < 1e-12
 
 
-def test_periodic_3d_solve():
-    _run_periodic_helmholtz_3d()
-
-
-@pytest.mark.parallel(nprocs=2)
-def test_periodic_3d_solve_parallel():
-    _run_periodic_helmholtz_3d()
