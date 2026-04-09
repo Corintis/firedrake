@@ -42,10 +42,12 @@ CUDA = GPUArch.CUDA
 class FiredrakeArch(enum.Enum):
     DEFAULT = "default"
     COMPLEX = "complex"
+    SINGLE = "single"
 
 
 ARCH_DEFAULT = FiredrakeArch.DEFAULT
 ARCH_COMPLEX = FiredrakeArch.COMPLEX
+ARCH_SINGLE = FiredrakeArch.SINGLE
 
 
 SUPPORTED_PETSC_VERSION = "v3.24.5"
@@ -324,10 +326,13 @@ MINIMAL_SYSTEM_PACKAGES = {
 SYSTEM_PACKAGES = {
     (LINUX_APT_X86_64, ARCH_DEFAULT, NO_GPU): LINUX_APT_PACKAGES_NOGPU,
     (LINUX_APT_X86_64, ARCH_COMPLEX, NO_GPU): LINUX_APT_PACKAGES_NOGPU,
+    (LINUX_APT_X86_64, ARCH_SINGLE, NO_GPU): LINUX_APT_PACKAGES_NOGPU,
     (LINUX_APT_AARCH64, ARCH_DEFAULT, NO_GPU): LINUX_APT_PACKAGES_NOGPU,
     (LINUX_APT_AARCH64, ARCH_COMPLEX, NO_GPU): LINUX_APT_PACKAGES_NOGPU,
+    (LINUX_APT_AARCH64, ARCH_SINGLE, NO_GPU): LINUX_APT_PACKAGES_NOGPU,
     (MACOS_HOMEBREW_ARM64, ARCH_DEFAULT, NO_GPU): MACOS_HOMEBREW_PACKAGES,
     (MACOS_HOMEBREW_ARM64, ARCH_COMPLEX, NO_GPU): MACOS_HOMEBREW_PACKAGES,
+    (MACOS_HOMEBREW_ARM64, ARCH_SINGLE, NO_GPU): MACOS_HOMEBREW_PACKAGES,
     (LINUX_APT_X86_64, ARCH_DEFAULT, CUDA): LINUX_APT_PACKAGES_CUDA,
     (LINUX_APT_AARCH64, ARCH_DEFAULT, CUDA): LINUX_APT_PACKAGES_CUDA,
 }
@@ -581,6 +586,8 @@ def prepare_configure_options(
 
     if arch == ARCH_COMPLEX:
         configure_options.append("--with-scalar-type=complex")
+    elif arch == ARCH_SINGLE:
+        configure_options.append("--with-precision=single")
 
     if gpu_arch == CUDA:
         configure_options.extend(
@@ -588,6 +595,11 @@ def prepare_configure_options(
         )
 
     external_packages = list(COMMON_PETSC_EXTERNAL_PACKAGES)
+    if arch == ARCH_SINGLE:
+        # These packages lack fp32 support
+        for pkg in ("fftw", "suitesparse"):
+            if pkg in external_packages:
+                external_packages.remove(pkg)
     if arch != ARCH_COMPLEX:
         external_packages.append("hypre")
     if gpu_arch == CUDA:
@@ -603,12 +615,16 @@ def prepare_configure_options(
 PETSC_VALID_BUILD_COMBINATIONS = (
     (LINUX_APT_X86_64, ARCH_DEFAULT, NO_GPU),
     (LINUX_APT_X86_64, ARCH_COMPLEX, NO_GPU),
+    (LINUX_APT_X86_64, ARCH_SINGLE, NO_GPU),
     (LINUX_APT_AARCH64, ARCH_DEFAULT, NO_GPU),
     (LINUX_APT_AARCH64, ARCH_COMPLEX, NO_GPU),
+    (LINUX_APT_AARCH64, ARCH_SINGLE, NO_GPU),
     (MACOS_HOMEBREW_ARM64, ARCH_DEFAULT, NO_GPU),
     (MACOS_HOMEBREW_ARM64, ARCH_COMPLEX, NO_GPU),
+    (MACOS_HOMEBREW_ARM64, ARCH_SINGLE, NO_GPU),
     (None, ARCH_DEFAULT, NO_GPU),
     (None, ARCH_COMPLEX, NO_GPU),
+    (None, ARCH_SINGLE, NO_GPU),
     (LINUX_APT_X86_64, ARCH_DEFAULT, CUDA),
     (LINUX_APT_AARCH64, ARCH_DEFAULT, CUDA),
     (None, ARCH_DEFAULT, CUDA),
