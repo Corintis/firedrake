@@ -56,14 +56,16 @@ cdef IndexPropertyH _make_index_properties(uint32_t dim) except *:
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-def from_regions(np.ndarray[np.float64_t, ndim=2, mode="c"] regions_lo,
-                 np.ndarray[np.float64_t, ndim=2, mode="c"] regions_hi):
+def from_regions(regions_lo_in, regions_hi_in):
     """Builds a spatial index from a set of maximum bounding regions (MBRs).
 
     regions_lo and regions_hi must have the same size.
     regions_lo[i] and regions_hi[i] contain the coordinates of the diagonally
     opposite lower and higher corners of the i-th MBR, respectively.
     """
+    # libspatialindex requires float64 — cast if needed (e.g., from float32)
+    cdef np.ndarray[np.float64_t, ndim=2, mode="c"] regions_lo = np.ascontiguousarray(regions_lo_in, dtype=np.float64)
+    cdef np.ndarray[np.float64_t, ndim=2, mode="c"] regions_hi = np.ascontiguousarray(regions_hi_in, dtype=np.float64)
     cdef:
         SpatialIndex spatial_index
         np.ndarray[np.int64_t, ndim=1, mode="c"] ids
