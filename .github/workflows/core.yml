@@ -83,10 +83,10 @@ jobs:
     name: Build and test Firedrake (Linux)
     strategy:
       # We want to know all of the tests which fail, so don't kill real if
-      # complex fails and vice-versa
+      # complex or single fails and vice-versa
       fail-fast: false
       matrix:
-        arch: [default, complex]
+        arch: [default, complex, single]
     runs-on: [self-hosted, Linux]
     container:
       image: ubuntu:latest
