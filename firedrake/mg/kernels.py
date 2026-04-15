@@ -189,7 +189,7 @@ def prolong_kernel(expression, Vf):
         __attribute__((noinline)) /* Clang bug */
         static void pyop2_kernel_prolong(PetscScalar *R, PetscScalar *f, const PetscScalar *X, const PetscScalar *Xc)
         {
-            PetscScalar Xref[%(tdim)d];
+            PetscReal Xref[%(tdim)d];
             int cell = -1;
             int bestcell = -1;
             PetscReal bestdist = 1e10;
@@ -273,7 +273,7 @@ def restrict_kernel(Vf, Vc):
         __attribute__((noinline)) /* Clang bug */
         static void pyop2_kernel_restrict(PetscScalar *R, PetscScalar *b, const PetscScalar *X, const PetscScalar *Xc)
         {
-            PetscScalar Xref[%(tdim)d];
+            PetscReal Xref[%(tdim)d];
             int cell = -1;
             int bestcell = -1;
             PetscReal bestdist = 1e10;
