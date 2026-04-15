@@ -50,7 +50,7 @@ ARCH_COMPLEX = FiredrakeArch.COMPLEX
 ARCH_SINGLE = FiredrakeArch.SINGLE
 
 
-SUPPORTED_PETSC_VERSION = "v3.24.5"
+SUPPORTED_PETSC_VERSION = "v3.25.0"
 # CUDA 13.1 is currently not supported by GPU drivers on Firedrake CI systems.
 SUPPORTED_CUDA_VERSION = "13.0"
 
