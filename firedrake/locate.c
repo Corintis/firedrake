@@ -1,7 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <spatialindex/capi/sidx_api.h>
-#include <float.h>
 #include <evaluate.h>
 
 PetscInt locate_cell(struct Function *f,
@@ -25,7 +24,7 @@ PetscInt locate_cell(struct Function *f,
     surrounds this is declared in pointquery_utils.py. We cast when we use the
     ref_coords_copy function and trust that the underlying memory which the
     pointers refer to is updated as necessary. */
-    PetscReal ref_cell_dist_l1 = DBL_MAX;
+    PetscReal ref_cell_dist_l1 = PETSC_MAX_REAL;
     PetscReal current_ref_cell_dist_l1 =  -0.5;
     /* NOTE: `tolerance`, which is used throughout this funciton, is a static
        variable defined outside this function when putting together all the C
