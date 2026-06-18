@@ -18,6 +18,7 @@ from pyop2.caching import memory_cache, disk_only_cache
 from pyop2.compilation import add_profiling_events, load
 from pyop2.configuration import configuration
 from pyop2.datatypes import IntType, as_ctypes
+from pyop2.codegen.gccvec import cell_vec_width
 from pyop2.codegen.rep2loopy import generate
 from pyop2.types import IterationRegion, Constant, READ
 
@@ -313,7 +314,8 @@ class GlobalKernel:
             *[a.cache_key for a in arguments],
             *[seen_maps[m] for a in arguments for m in a.maps],
             extruded, extruded_periodic, constant_layers, subset,
-            iteration_region, pass_layer_arg, configuration["simd_width"]
+            iteration_region, pass_layer_arg, configuration["simd_width"],
+            cell_vec_width()
         )
         self.local_kernel = local_kernel
         self.arguments = arguments

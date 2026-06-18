@@ -1636,8 +1636,12 @@ def _global_kernel_cache_key(form, local_knl, subdomain_id, all_integer_subdomai
                 else:
                     subdomain_key.append((k, i))
 
+    # The generated code depends on the requested cross-element vector width
+    # (cached GlobalKernel instances bake it into their own cache key).
+    from pyop2.codegen.gccvec import cell_vec_width
+
     return (domain_ids
-            + (sig, subdomain_id)
+            + (sig, subdomain_id, cell_vec_width())
             + tuple(subdomain_key)
             + tuplify(all_integer_subdomain_ids)
             + cachetools.keys.hashkey(local_knl, **kwargs))

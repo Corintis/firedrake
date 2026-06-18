@@ -406,7 +406,7 @@ def instruction_dependencies(instructions, initialisers):
     return dict((op, (names[op], dep)) for op, dep in deps.items())
 
 
-def generate(builder, wrapper_name=None):
+def generate(builder, wrapper_name=None, *, disable_cell_vec=False):
     # Reset all terminal counters to avoid generated code becoming different across ranks
     Argument._count = defaultdict(partial(itertools.count))
     Index._count = itertools.count()
@@ -589,6 +589,43 @@ def generate(builder, wrapper_name=None):
     # register petsc functions
     for identifier in petsc_functions:
         wrapper = loopy.register_callable(wrapper, identifier, PetscCallable(name=identifier))
+
+    # Cross-element vectorization (opt-in via PYOP2_CELL_VEC_WIDTH > 1).
+    # Processes VL cells per iteration with the cell index on the SIMD lane;
+    # see pyop2.codegen.gccvec.  Conservatively restricted to plain cell
+    # integrals on non-extruded meshes (the validated, correct case): facet
+    # integrals and extruded/layered iteration have a different wrapper
+    # structure that this transform does not handle.  Matrix assembly falls
+    # back automatically (its scatter is a CInstruction the transform rejects).
+    # Any unsupported structure raises inside the transform and we keep the
+    # scalar wrapper.
+    from pyop2.codegen.gccvec import (cross_element_vectorize, cell_vec_width,
+                                      syntax_check_ok, _debug)
+    _vl = 0 if disable_cell_vec else cell_vec_width()
+    if (_vl > 1
+            and isinstance(kernel.code, loopy.TranslationUnit)
+            and builder._loop_index.name == "n"
+            and not builder.extruded
+            and builder.layer_index is None
+            and not getattr(kernel, "cpp", False)
+            and kernel.name.endswith("cell_integral")):
+        try:
+            vec_wrapper = cross_element_vectorize(wrapper, kernel.name, _vl)
+            # Validate the result end-to-end (loopy codegen + a C syntax
+            # check) so that any structure the transform mishandled is
+            # caught here and degrades to the scalar wrapper.  The
+            # generated code is persistently cached by loopy, so the real
+            # code generation later does not repeat the work.
+            code = loopy.generate_code_v2(vec_wrapper).device_code()
+            if not syntax_check_ok(code, getattr(kernel, "include_dirs", ())):
+                raise ValueError("vectorized wrapper failed C syntax check")
+            wrapper = vec_wrapper
+            _debug(f"APPLIED vl={_vl} {kernel.name}")
+        except Exception as e:
+            # keep the scalar wrapper if vectorization is not applicable
+            _debug(f"FALLBACK {kernel.name}: {type(e).__name__}: {e}")
+    elif _vl > 1:
+        _debug(f"SKIPPED (gate) {kernel.name}")
 
     return wrapper
 
