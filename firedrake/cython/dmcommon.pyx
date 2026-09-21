@@ -544,6 +544,71 @@ cdef inline PetscInt _reorder_plex_closure(PETSc.DM dm,
         fiat_closure[24] = plex_closure[2 * 1]
         fiat_closure[25] = plex_closure[2 * 2]
         fiat_closure[26] = plex_closure[2 * 0]
+    elif dm.getCellType(p) == PETSc.DM.PolytopeType.TRI_PRISM:
+        # UFCPrism:                 PETSc.DM.PolytopeType.TRI_PRISM:
+        #
+        #   vertices   0 .. 5         cell                      0
+        #   edges      6 .. 14        triangles (cone 0, 1)     1, 2
+        #   faces     15 .. 19        quadrilaterals (cone 2-4) 3, 4, 5
+        #   cell      20              edges                     6 .. 14
+        #                             vertices of triangle 1    15, 16, 17
+        #                             vertices of triangle 2    18, 19, 20
+        #
+        # The UFCPrism is the flattened product of a UFCTriangle and a
+        # UFCInterval. Each triangle vertex pairs with both ends of the
+        # interval, so its vertices are
+        #
+        #   v0 = (0, 0, 0)   v1 = (0, 0, 1)
+        #   v2 = (1, 0, 0)   v3 = (1, 0, 1)
+        #   v4 = (0, 1, 0)   v5 = (0, 1, 1)
+        #
+        # and (v0, v1), (v2, v3), (v4, v5) are the three axis edges e0, e1, e2.
+        # The remaining edges e3 to e8 lie in the two triangular bases. Faces
+        # f0, f1, f2 are the quadrilaterals and faces f3, f4 are the bases.
+        #
+        # The cone fixes the axis: cone slots 0 and 1 of a TRI_PRISM always
+        # hold the two triangular bases and slots 2, 3, 4 the three
+        # quadrilaterals. So the axis edges pair the closure entries
+        # (15, 18), (16, 20) and (17, 19). Note that this is NOT the
+        # pairing (15, 18), (16, 19), (17, 20).
+        #
+        # To check, run the following with "-dm_view ascii::ascii_info_detail":
+        #
+        # >>> mesh = Mesh("prism_meshes/prism_reference.msh")
+        # >>> fiat_cell = as_fiat_cell(mesh.ufl_cell())
+        # >>> print(fiat_cell.vertices)
+        # >>> print(fiat_cell.topology)
+        # >>> mesh.topology_dm.viewFromOptions("-dm_view")
+        # >>> closure, _ = mesh.topology_dm.getTransitiveClosure(0)
+        # >>> print(closure)
+        fiat_closure[0] = plex_closure[2 * 15]
+        fiat_closure[1] = plex_closure[2 * 18]
+        fiat_closure[2] = plex_closure[2 * 16]
+        fiat_closure[3] = plex_closure[2 * 20]
+        fiat_closure[4] = plex_closure[2 * 17]
+        fiat_closure[5] = plex_closure[2 * 19]
+        fiat_closure[6] = plex_closure[2 * 13]
+        fiat_closure[7] = plex_closure[2 * 14]
+        fiat_closure[8] = plex_closure[2 * 12]
+        fiat_closure[9] = plex_closure[2 * 7]
+        fiat_closure[10] = plex_closure[2 * 10]
+        fiat_closure[11] = plex_closure[2 * 8]
+        fiat_closure[12] = plex_closure[2 * 9]
+        fiat_closure[13] = plex_closure[2 * 6]
+        fiat_closure[14] = plex_closure[2 * 11]
+        fiat_closure[15] = plex_closure[2 * 4]
+        fiat_closure[16] = plex_closure[2 * 3]
+        fiat_closure[17] = plex_closure[2 * 5]
+        fiat_closure[18] = plex_closure[2 * 1]
+        fiat_closure[19] = plex_closure[2 * 2]
+        fiat_closure[20] = plex_closure[2 * 0]
+    elif dm.getCellType(p) == PETSc.DM.PolytopeType.TRI_PRISM_TENSOR:
+        raise NotImplementedError(
+            "TRI_PRISM_TENSOR is not supported. Its cone orders the faces "
+            "differently from TRI_PRISM, so the TRI_PRISM permutation does "
+            "not apply. Use a gmsh file that holds prisms only: PETSc gives "
+            "the tensor type when a file holds both prisms and tetrahedra."
+        )
     else:
         raise NotImplementedError(f"Not implemented for {dm.getCellType(p)}")
 
@@ -1181,6 +1246,15 @@ cdef inline PetscInt _compute_orientation(PETSc.DM dm,
         dim = 3
         _reorder_plex_cone(dm, p, cone, plex_cone)
         return _compute_orientation_interval_tensor_product(fiat_cone, plex_cone, plex_cone_copy, dim)
+    elif ct == DM_POLYTOPE_TRI_PRISM:
+        # UFCPrism. _reorder_plex_closure() already puts the closure of a
+        # TRI_PRISM cell in the FIAT order, so the cell orientation is 0.
+        return 0
+    elif ct == DM_POLYTOPE_TRI_PRISM_TENSOR:
+        raise NotImplementedError(
+            "TRI_PRISM_TENSOR is not supported. Its cone orders the faces "
+            "differently from TRI_PRISM. Use a gmsh file that holds prisms only."
+        )
     else:
         raise ValueError(f"Unknown cell type: {ct}")
 
