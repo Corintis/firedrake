@@ -83,6 +83,18 @@ _cells = {
 }
 
 
+# The UFL cell name of each supported facet count, per topological dimension.
+# This table is only for a mixed-cell topology, which has no single UFL cell.
+# Use _cells for every other mesh: a facet count can not tell a triangular
+# prism from a pyramid.
+_cells_by_facet_count = {
+    0: {0: "vertex"},
+    1: {2: "interval"},
+    2: {3: "triangle", 4: "quadrilateral"},
+    3: {4: "tetrahedron", 6: "hexahedron"}
+}
+
+
 # Cell types that Firedrake recognises but does not support, with the reason.
 _unsupported_cells = {
     PETSc.DM.PolytopeType.PYRAMID:
@@ -1204,15 +1216,45 @@ class MeshTopology(AbstractMeshTopology):
         # dm_cell_types reduces over the communicator, so a process with an
         # empty local mesh reports the same cell types as every other process.
         cell_types = self.dm_cell_types
-        if len(cell_types) != 1:
-            raise NotImplementedError(
-                f"Mixed-cell meshes are not supported; got cell types {cell_types}"
-            )
-        cell_type, = cell_types
-        if cell_type in _unsupported_cells:
-            raise NotImplementedError(_unsupported_cells[cell_type])
-        if cell_type not in _cells:
-            raise NotImplementedError(f"Unsupported DMPlex cell type: {cell_type}")
+        for cell_type in cell_types:
+            if cell_type in _unsupported_cells:
+                raise NotImplementedError(_unsupported_cells[cell_type])
+        if len(cell_types) == 1:
+            cell_type, = cell_types
+            if cell_type not in _cells:
+                raise NotImplementedError(
+                    f"Unsupported DMPlex cell type: {cell_type}"
+                )
+            cellname = _cells[cell_type]
+        else:
+            # A mixed-cell topology has no single UFL cell. The callers that
+            # support one, such as _make_mesh_from_coordinates, test
+            # dm_cell_types themselves and never use this cell, but they run
+            # after this property, so it must return something rather than
+            # raise.
+            #
+            # The lines below are deliberately verbatim from 458649bba, the
+            # commit before this method dispatched on the cell type. Keep them
+            # that way. They take the cone size of the FIRST LOCAL cell and
+            # reduce it with MPI.MAX over the COMMUNICATOR, never over the
+            # cells, so for a mixed-cell mesh the answer depends on the
+            # partition: it is whatever cell 0 happens to be on one process,
+            # and the largest of each process's first local cell on several.
+            # That is surprising, and correcting it would change the behaviour
+            # of a path that mixed-cell support is a separate project for. Do
+            # not make it deterministic and do not take the maximum over all
+            # cells.
+            plex = self.topology_dm
+            tdim = plex.getDimension()
+            # Allow empty local meshes on a process
+            cStart, cEnd = plex.getHeightStratum(0)  # cells
+            if cStart == cEnd:
+                nfacets = -1
+            else:
+                nfacets = plex.getConeSize(cStart)
+            with temp_internal_comm(self.comm) as icomm:
+                nfacets = icomm.allreduce(nfacets, op=MPI.MAX)
+            cellname = _cells_by_facet_count[tdim][nfacets]
 
         # Note that the geometric dimension of the cell is not set here
         # despite it being a property of a UFL cell. It will default to
@@ -1221,7 +1263,7 @@ class MeshTopology(AbstractMeshTopology):
         # represent a mesh topology (as here) have geometric dimension
         # equal their topological dimension. This is reflected in the
         # corresponding UFL mesh.
-        return ufl.Cell(_cells[cell_type])
+        return ufl.Cell(cellname)
 
     @cached_property
     def _ufl_mesh(self):

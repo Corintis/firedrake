@@ -207,12 +207,28 @@ def test_prism_cell_orientation_is_zero(meshname):
 
 # ------------------------------------------------------------------ assembly
 
-def test_prism_mass_matrix_total_is_the_volume():
+GAP2_UNSAFE = (
+    "Task 2c, gap 2. DO NOT DELETE THIS SKIP AS MERELY UNSUPPORTED. The test "
+    "PASSES today, but only because an out-of-bounds read returned 0 in this "
+    "build. At CG2 and above a quadrilateral face carries dofs, so "
+    "get_cell_nodes indexes the permutation table past its end under "
+    "boundscheck(False): at CG2 the read is index 36 of a 36 element array. "
+    "The assertion can not detect the defect either, because a mass matrix "
+    "total equals the cell volume even when dofs land on the wrong entity. "
+    "Re-enable this when gap 2 is closed."
+)
+
+
+@pytest.mark.parametrize("degree", [
+    1,
+    pytest.param(2, marks=pytest.mark.skip(reason=GAP2_UNSAFE)),
+    pytest.param(3, marks=pytest.mark.skip(reason=GAP2_UNSAFE)),
+])
+def test_prism_mass_matrix_total_is_the_volume(degree):
     mesh = Mesh(str(MESHDIR / "prism_reference.msh"))
-    for degree in (1, 2, 3):
-        V = FunctionSpace(mesh, "CG", degree)
-        M = assemble(inner(TrialFunction(V), TestFunction(V)) * dx).M.values
-        assert np.isclose(M.sum(), 0.5, rtol=0, atol=1e-12)
+    V = FunctionSpace(mesh, "CG", degree)
+    M = assemble(inner(TrialFunction(V), TestFunction(V)) * dx).M.values
+    assert np.isclose(M.sum(), 0.5, rtol=0, atol=1e-12)
 
 
 def test_prism_volume(meshname):
@@ -233,13 +249,13 @@ def test_prism_slab_volume_from_the_gmsh_geometry():
 
 @pytest.mark.parametrize("degree", [
     1,
-    2,
+    pytest.param(2, marks=pytest.mark.skip(reason=GAP2_UNSAFE)),
     pytest.param(3, marks=pytest.mark.xfail(
-        strict=True, reason="gap 2: the quadrilateral face orientation is out "
-                            "of the range the FInAT prism element supplies")),
+        strict=True, reason="Task 2c, gap 2: the quadrilateral face orientation "
+                            "is out of the range the FInAT prism element supplies")),
     pytest.param(4, marks=pytest.mark.xfail(
-        strict=True, reason="gap 2: the quadrilateral face orientation is out "
-                            "of the range the FInAT prism element supplies")),
+        strict=True, reason="Task 2c, gap 2: the quadrilateral face orientation "
+                            "is out of the range the FInAT prism element supplies")),
 ])
 def test_prism_interpolation_is_exact_on_one_cell(degree):
     """A polynomial of P_k(triangle) x P_k(interval) interpolates exactly."""
@@ -291,8 +307,9 @@ def test_prism_function_space_has_no_unreferenced_dofs(degree):
     assert referenced == V.dim()
 
 
-@pytest.mark.xfail(strict=True, reason="gap 2: PETSc transposes the axes of a "
-                                       "TRI_PRISM quadrilateral face cone")
+@pytest.mark.xfail(strict=True, reason="Task 2c, gap 2: PETSc transposes the "
+                                       "axes of a TRI_PRISM quadrilateral face "
+                                       "cone")
 def test_prism_quad_face_orientations_are_in_range(meshname):
     mesh = Mesh(str(MESHDIR / meshname))
     V = FunctionSpace(mesh, "CG", 3)
