@@ -218,6 +218,28 @@ _GAP2_UNSAFE_HEAD = (
 )
 _GAP2_UNSAFE_TAIL = " Re-enable this when gap 2 is closed."
 
+CG2_CORRECT_BUT_NOT_YET_SAFE = """\
+Task 2c, gap 2. DO NOT READ A GREEN CG2 TEST AS "CG2 IS MEMORY SAFE".
+
+Separate the result from the read.
+
+The RESULT is correct, and for a structural reason, not by luck. At CG2 a
+quadrilateral face carries exactly ONE interior dof, and the only permutation of
+a one element set is the identity. No orientation, in range or out of range, can
+misorder a single dof. So the dof numbering that Task 2b gives is the whole
+answer at this degree, and these tests measure it honestly.
+
+The READ is still unsafe. get_cell_nodes indexes the permutation table past its
+end under boundscheck(False), because a prism quadrilateral face presents all 8
+orientations while the FInAT element supplies only the 4 with extrinsic part 0.
+That is undefined behaviour whatever value it returns. Task 2c removes it, and
+Task 2c has to re-run these tests once it does.
+
+From CG3 upwards a quadrilateral face carries 4 or more dofs, the identity
+argument fails, and the result is wrong as well. The CG3 and CG4 cases below are
+strict xfails for exactly that reason.
+"""
+
 GAP2_UNSAFE_MASS = (
     _GAP2_UNSAFE_HEAD
     + "The assertion can not detect the defect either, because a mass matrix "
@@ -286,6 +308,8 @@ def test_prism_interpolation_is_exact_on_one_cell(degree):
 
 # ------------------------------------------------------------------- Poisson
 
+# Task 2b turns the degree 2 case on. See CG2_CORRECT_BUT_NOT_YET_SAFE above:
+# the result is correct, the permutation read is not yet in bounds.
 @pytest.mark.parallel([1, 2, 3])
 @pytest.mark.parametrize("degree", [1, 2])
 def test_prism_poisson_with_strong_dirichlet(degree):
@@ -307,6 +331,11 @@ def test_prism_poisson_with_strong_dirichlet(degree):
 
 
 # --------------------------------------------------- the dof numbering, gap 1
+#
+# Task 2b closed gap 1, so the tests below pass. Every one of them that builds a
+# space of degree 2 or more also performs the out of bounds permutation read that
+# CG2_CORRECT_BUT_NOT_YET_SAFE describes. Read that text before you take a green
+# result here as a statement about memory safety.
 
 # The plex entity counts of prism_slab.msh. test_prism_slab_entity_counts below
 # checks them against the mesh itself.
