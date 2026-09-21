@@ -70,11 +70,28 @@ __all__ = [
 ]
 
 
+# The UFL cell name of each supported DMPlex cell type. A facet count can not
+# key this table: a triangular prism and a pyramid both have 5 facets.
 _cells = {
-    0: {0: "vertex"},
-    1: {2: "interval"},
-    2: {3: "triangle", 4: "quadrilateral"},
-    3: {4: "tetrahedron", 6: "hexahedron"}
+    PETSc.DM.PolytopeType.POINT: "vertex",
+    PETSc.DM.PolytopeType.SEGMENT: "interval",
+    PETSc.DM.PolytopeType.TRIANGLE: "triangle",
+    PETSc.DM.PolytopeType.QUADRILATERAL: "quadrilateral",
+    PETSc.DM.PolytopeType.TETRAHEDRON: "tetrahedron",
+    PETSc.DM.PolytopeType.HEXAHEDRON: "hexahedron",
+    PETSc.DM.PolytopeType.TRI_PRISM: "prism",
+}
+
+
+# Cell types that Firedrake recognises but does not support, with the reason.
+_unsupported_cells = {
+    PETSc.DM.PolytopeType.PYRAMID:
+        "Pyramid cells (DM_POLYTOPE_PYRAMID) are not supported.",
+    PETSc.DM.PolytopeType.TRI_PRISM_TENSOR:
+        "Tensor product prism cells (DM_POLYTOPE_TRI_PRISM_TENSOR) are not "
+        "supported; only DM_POLYTOPE_TRI_PRISM is. The two types order their "
+        "cones differently. A gmsh file that holds both prisms and tetrahedra "
+        "gives the tensor type, so write a file that holds prisms only.",
 }
 
 
@@ -1183,18 +1200,19 @@ class MeshTopology(AbstractMeshTopology):
 
     @cached_property
     def _ufl_cell(self):
-        plex = self.topology_dm
-        tdim = plex.getDimension()
-        # Allow empty local meshes on a process
-        cStart, cEnd = plex.getHeightStratum(0)  # cells
-        if cStart == cEnd:
-            nfacets = -1
-        else:
-            nfacets = plex.getConeSize(cStart)
-
         # TODO: this needs to be updated for mixed-cell meshes.
-        with temp_internal_comm(self.comm) as icomm:
-            nfacets = icomm.allreduce(nfacets, op=MPI.MAX)
+        # dm_cell_types reduces over the communicator, so a process with an
+        # empty local mesh reports the same cell types as every other process.
+        cell_types = self.dm_cell_types
+        if len(cell_types) != 1:
+            raise NotImplementedError(
+                f"Mixed-cell meshes are not supported; got cell types {cell_types}"
+            )
+        cell_type, = cell_types
+        if cell_type in _unsupported_cells:
+            raise NotImplementedError(_unsupported_cells[cell_type])
+        if cell_type not in _cells:
+            raise NotImplementedError(f"Unsupported DMPlex cell type: {cell_type}")
 
         # Note that the geometric dimension of the cell is not set here
         # despite it being a property of a UFL cell. It will default to
@@ -1203,7 +1221,7 @@ class MeshTopology(AbstractMeshTopology):
         # represent a mesh topology (as here) have geometric dimension
         # equal their topological dimension. This is reflected in the
         # corresponding UFL mesh.
-        return ufl.Cell(_cells[tdim][nfacets])
+        return ufl.Cell(_cells[cell_type])
 
     @cached_property
     def _ufl_mesh(self):
@@ -1295,8 +1313,10 @@ class MeshTopology(AbstractMeshTopology):
 
             return dmcommon.quadrilateral_closure_ordering(
                 plex, vertex_numbering, cell_numbering, cell_orientations)
-        elif cell.cellname == "hexahedron":
+        elif cell.cellname in {"hexahedron", "prism"}:
             # TODO: Should change and use create_cell_closure() for all cell types.
+            # For a prism the closure size is 21: 6 vertices, 9 edges,
+            # 5 faces and the cell itself.
             topology = FIAT.ufc_cell(cell).get_topology()
             closureSize = sum([len(ents) for _, ents in topology.items()])
             return dmcommon.create_cell_closure(plex, cell_numbering, closureSize)
@@ -2089,7 +2109,7 @@ class VertexOnlyMeshTopology(AbstractMeshTopology):
 
     @cached_property
     def _ufl_cell(self):
-        return ufl.Cell(_cells[0][0])
+        return ufl.Cell(_cells[PETSc.DM.PolytopeType.POINT])
 
     @cached_property
     def _ufl_mesh(self):
