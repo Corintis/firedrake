@@ -64,3 +64,8 @@ pyop2.log
 *.msh
 *.node
 *.geo
+
+# The prism meshes are test data, not build output. prism_reference.msh is
+# written by hand, because gmsh will not put a single prism at chosen
+# coordinates, so it can not be regenerated.
+!prism_meshes/*.msh
