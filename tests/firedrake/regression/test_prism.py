@@ -132,6 +132,17 @@ def test_prism_mesh_builds(meshname):
     assert mesh.geometric_dimension == 3
 
 
+@pytest.mark.parallel([1, 3])
+def test_prism_mesh_builds_on_a_process_with_no_cells():
+    """prism_reference.msh holds one cell, so two of three processes get none.
+
+    _ufl_cell reduces over the communicator, so every process must agree.
+    """
+    mesh = Mesh(str(MESHDIR / "prism_reference.msh"))
+    assert mesh.ufl_cell().cellname == "prism"
+    assert np.isclose(float(assemble(Constant(1.0) * dx(domain=mesh))), 0.5)
+
+
 def test_prism_dm_cell_type(meshname):
     mesh = Mesh(str(MESHDIR / meshname))
     assert mesh.topology.dm_cell_types == (PETSc.DM.PolytopeType.TRI_PRISM,)
