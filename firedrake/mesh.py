@@ -95,6 +95,21 @@ _cells_by_facet_count = {
 }
 
 
+# The DMPlex polytope type of a reference cell sub-entity, keyed by the pair
+# of its topological dimension and its number of vertices. The prism is the
+# only supported cell whose sub-entities of one dimension do not all share a
+# polytope type: its facets are three quadrilaterals and two triangles.
+_sub_entity_polytope_types = {
+    (0, 1): PETSc.DM.PolytopeType.POINT,
+    (1, 2): PETSc.DM.PolytopeType.SEGMENT,
+    (2, 3): PETSc.DM.PolytopeType.TRIANGLE,
+    (2, 4): PETSc.DM.PolytopeType.QUADRILATERAL,
+    (3, 4): PETSc.DM.PolytopeType.TETRAHEDRON,
+    (3, 6): PETSc.DM.PolytopeType.TRI_PRISM,
+    (3, 8): PETSc.DM.PolytopeType.HEXAHEDRON,
+}
+
+
 # Cell types that Firedrake recognises but does not support, with the reason.
 _unsupported_cells = {
     PETSc.DM.PolytopeType.PYRAMID:
@@ -606,20 +621,24 @@ class AbstractMeshTopology(object, metaclass=abc.ABCMeta):
             else:
                 self._dm_renumbering = self._renumber_entities(reorder)
             self._did_reordering = bool(reorder)
-            # Derive a cell numbering from the Plex renumbering
+            # Derive a cell numbering from the Plex renumbering. The section
+            # takes one dof count per numbering stratum, which is one per
+            # dimension for every cell type but the prism, so put one dof on
+            # every stratum of the dimension that is being numbered.
             tdim = dmcommon.get_topological_dimension(self.topology_dm)
-            entity_dofs = np.zeros(tdim+1, dtype=IntType)
-            entity_dofs[-1] = 1
-            self._cell_numbering, _ = self.create_section(entity_dofs)
+            strata = self._numbering_strata
+
+            def one_dof_on_dimension(dim):
+                dofs = np.zeros(len(strata), dtype=IntType)
+                dofs[[index for index, (d, _) in enumerate(strata) if d == dim]] = 1
+                return dofs
+
+            self._cell_numbering, _ = self.create_section(one_dof_on_dimension(tdim))
             if tdim == 0:
                 self._vertex_numbering = self._cell_numbering
             else:
-                entity_dofs[:] = 0
-                entity_dofs[0] = 1
-                self._vertex_numbering, _ = self.create_section(entity_dofs)
-                entity_dofs[:] = 0
-                entity_dofs[-2] = 1
-                facet_numbering, _ = self.create_section(entity_dofs)
+                self._vertex_numbering, _ = self.create_section(one_dof_on_dimension(0))
+                facet_numbering, _ = self.create_section(one_dof_on_dimension(tdim - 1))
                 self._facet_ordering = dmcommon.get_facet_ordering(self.topology_dm, facet_numbering)
         self.name = name
         # Set/Generate names to be used when checkpointing.
@@ -797,13 +816,70 @@ class AbstractMeshTopology(object, metaclass=abc.ABCMeta):
         """
         return dmcommon.create_section(self, nodes_per_entity, on_base=real_tensorproduct, block_size=block_size, boundary_set=boundary_set)
 
+    @cached_property
+    def _plex_polytope_types(self):
+        """The DMPlex polytope types of each topological dimension.
+
+        Entry ``d`` is ``(None,)`` when every plex point of dimension ``d`` has
+        the same polytope type, and otherwise the tuple of the polytope types of
+        that dimension. ``None`` means "every point of the dimension".
+        """
+        return ((None, ), ) * (dmcommon.get_topological_dimension(self.topology_dm) + 1)
+
+    @cached_property
+    def _numbering_strata(self):
+        """The numbering strata of the mesh, in order.
+
+        A numbering stratum is a set of plex points that a function space gives
+        the same number of dofs. Each entry is a pair of a topological dimension
+        and a DMPlex polytope type, where ``None`` as the type means every point
+        of that dimension.
+
+        A numbering stratum is a depth stratum of the plex for every cell type
+        but the prism. The dimension 2 points of a prism mesh are triangles and
+        quadrilaterals, and a Lagrange space of degree 2 or more gives those two
+        different numbers of dofs, so that dimension supplies two strata.
+        """
+        return tuple((dim, polytope_type)
+                     for dim, polytope_types in enumerate(self._plex_polytope_types)
+                     for polytope_type in polytope_types)
+
+    @cached_property
+    def _entity_classes_per_stratum(self):
+        """The PyOP2 entity class offsets of each numbering stratum.
+
+        This is ``_entity_classes`` when every dimension has a single polytope
+        type, which is every cell type but the prism.
+        """
+        if all(len(types) == 1 for types in self._plex_polytope_types):
+            return self._entity_classes
+        strata = self._numbering_strata
+        return dmcommon.get_entity_classes_per_stratum(
+            self.topology_dm,
+            np.asarray([dim for dim, _ in strata], dtype=IntType),
+            np.asarray([-1 if t is None else int(t) for _, t in strata], dtype=IntType),
+        ).astype(int)
+
+    @cached_property
+    def _fiat_sub_entity_polytope_types(self):
+        """The DMPlex polytope type of each sub-entity of the reference cell.
+
+        Entry ``[d][e]`` is the polytope type of the FIAT local entity ``e`` of
+        dimension ``d``.
+        """
+        topology = FIAT.ufc_cell(self.ufl_cell()).get_topology()
+        return {dim: {entity: _sub_entity_polytope_types[(dim, len(vertices))]
+                      for entity, vertices in entities.items()}
+                for dim, entities in topology.items()}
+
     def node_classes(self, nodes_per_entity, real_tensorproduct=False):
         """Compute node classes given nodes per entity.
 
-        :arg nodes_per_entity: number of function space nodes per topological entity.
+        :arg nodes_per_entity: number of function space nodes per numbering
+            stratum. See :meth:`make_dofs_per_plex_entity`.
         :returns: the number of nodes in each of core, owned, and ghost classes.
         """
-        return tuple(np.dot(nodes_per_entity, self._entity_classes))
+        return tuple(np.dot(nodes_per_entity, self._entity_classes_per_stratum))
 
     def make_cell_node_list(self, global_numbering, entity_dofs, entity_permutations, offsets):
         """Builds the DoF mapping.
@@ -817,12 +893,47 @@ class AbstractMeshTopology(object, metaclass=abc.ABCMeta):
                                        entity_dofs, entity_permutations, offsets)
 
     def make_dofs_per_plex_entity(self, entity_dofs):
-        """Returns the number of DoFs per plex entity for each stratum,
-        i.e. [#dofs / plex vertices, #dofs / plex edges, ...].
+        """Returns the number of DoFs per plex entity for each numbering
+        stratum, i.e. [#dofs / plex vertices, #dofs / plex edges, ...].
+
+        There is one entry per numbering stratum, which is one entry per
+        topological dimension for every cell type but the prism. A prism mesh
+        holds both triangular and quadrilateral faces, which carry different
+        numbers of dofs, so its dimension 2 supplies one entry per polytope
+        type. See :attr:`_numbering_strata`.
 
         :arg entity_dofs: FInAT element entity DoFs
         """
-        return [len(entity_dofs[d][0]) for d in sorted(entity_dofs)]
+        polytope_types = self._plex_polytope_types
+        if all(len(types) == 1 for types in polytope_types):
+            return [len(entity_dofs[d][0]) for d in sorted(entity_dofs)]
+        dofs_per_stratum = []
+        for dim in sorted(entity_dofs):
+            counts = {entity: len(dofs) for entity, dofs in entity_dofs[dim].items()}
+            if len(polytope_types[dim]) == 1:
+                dofs_per_stratum.append(counts[0])
+            elif len(set(counts.values())) == 1:
+                # The dimension splits, but the element gives every entity of it
+                # the same number of dofs, so the polytope type does not matter.
+                # A mixed-cell mesh takes this path on its cell dimension.
+                dofs_per_stratum.extend([counts[0]] * len(polytope_types[dim]))
+            else:
+                fiat_types = self._fiat_sub_entity_polytope_types
+                for polytope_type in polytope_types[dim]:
+                    of_type = {counts[entity] for entity in sorted(counts)
+                               if fiat_types[dim][entity] == polytope_type}
+                    if not of_type:
+                        raise RuntimeError(
+                            f"The mesh has points of dimension {dim} and "
+                            f"polytope type {polytope_type}, but the element "
+                            "has no such sub-entity")
+                    if len(of_type) != 1:
+                        raise NotImplementedError(
+                            f"The element gives the dimension {dim} "
+                            f"sub-entities of polytope type {polytope_type} "
+                            "different numbers of dofs")
+                    dofs_per_stratum.append(of_type.pop())
+        return dofs_per_stratum
 
     def make_offset(self, entity_dofs, ndofs, real_tensorproduct=False):
         """Returns None (only for extruded use)."""
@@ -1290,6 +1401,11 @@ class MeshTopology(AbstractMeshTopology):
     def dm_cell_types(self):
         """All DM.PolytopeTypes of cells in the mesh."""
         return dmcommon.get_dm_cell_types(self.topology_dm)
+
+    @cached_property
+    def _plex_polytope_types(self):
+        """The DMPlex polytope types of each topological dimension."""
+        return dmcommon.get_plex_polytope_types(self.topology_dm)
 
     @cached_property
     def cell_closure(self):
@@ -1879,6 +1995,8 @@ class ExtrudedMeshTopology(MeshTopology):
         self._dm_renumbering = mesh._dm_renumbering
         self._cell_numbering = mesh._cell_numbering
         self._entity_classes = mesh._entity_classes
+        # The base mesh already reduced these over the communicator.
+        self._plex_polytope_types = mesh._plex_polytope_types
         self._did_reordering = mesh._did_reordering
         self._distribution_parameters = mesh._distribution_parameters
         self._subsets = {}

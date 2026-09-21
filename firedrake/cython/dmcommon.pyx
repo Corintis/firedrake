@@ -1374,8 +1374,11 @@ def create_section(mesh, nodes_per_entity, on_base=False, block_size=1, boundary
         PETSc.Section section
         PETSc.IS renumbering
         PetscInt i, p, layers, offset_top, pStart, pEnd, dof, j, k
-        PetscInt dimension, ndof
+        PetscInt dimension, ndof, nstrata, stratum_type
         PetscInt *dof_array = NULL
+        PetscInt[::1] strata_dim
+        PetscInt[::1] strata_type
+        PetscDMPolytopeType celltype
         np.ndarray nodes
         np.ndarray layer_extents
         np.ndarray points
@@ -1393,20 +1396,29 @@ def create_section(mesh, nodes_per_entity, on_base=False, block_size=1, boundary
     extruded_periodic = mesh.cell_set._extruded_periodic
     on_base_ = on_base
     dimension = get_topological_dimension(dm)
+    # One entry of nodes_per_entity per numbering stratum, not per dimension.
+    # A numbering stratum is a depth stratum for every cell type except the
+    # prism, whose dimension 2 points are triangles and quadrilaterals and
+    # carry different numbers of dofs. See MeshTopology._numbering_strata.
+    strata = mesh._numbering_strata
+    nstrata = len(strata)
+    strata_dim = np.asarray([d for d, _ in strata], dtype=IntType)
+    strata_type = np.asarray([-1 if t is None else int(t) for _, t in strata],
+                             dtype=IntType)
     nodes_per_entity = np.asarray(nodes_per_entity, dtype=IntType)
     if variable:
         layer_extents = mesh.layer_extents
-        nodes = nodes_per_entity.reshape(dimension + 1, -1)
+        nodes = nodes_per_entity.reshape(nstrata, -1)
     elif extruded:
         if on_base:
-            nodes = sum(nodes_per_entity[:, i] for i in range(2)).reshape(dimension + 1, -1)
+            nodes = sum(nodes_per_entity[:, i] for i in range(2)).reshape(nstrata, -1)
         else:
             if extruded_periodic:
-                nodes = sum(nodes_per_entity[:, i]*(mesh.layers - 1) for i in range(2)).reshape(dimension + 1, -1)
+                nodes = sum(nodes_per_entity[:, i]*(mesh.layers - 1) for i in range(2)).reshape(nstrata, -1)
             else:
-                nodes = sum(nodes_per_entity[:, i]*(mesh.layers - i) for i in range(2)).reshape(dimension + 1, -1)
+                nodes = sum(nodes_per_entity[:, i]*(mesh.layers - i) for i in range(2)).reshape(nstrata, -1)
     else:
-        nodes = nodes_per_entity.reshape(dimension + 1, -1)
+        nodes = nodes_per_entity.reshape(nstrata, -1)
     section = PETSc.Section().create(comm=mesh.comm)
     get_chart(dm.dm, &pStart, &pEnd)
     section.setChart(pStart, pEnd)
@@ -1417,11 +1429,18 @@ def create_section(mesh, nodes_per_entity, on_base=False, block_size=1, boundary
         renumbering = mesh._dm_renumbering
 
     CHKERR(PetscSectionSetPermutation(section.sec, renumbering.iset))
-    for i in range(dimension + 1):
-        get_depth_stratum(dm.dm, i, &pStart, &pEnd)  # gets all points at dim i
+    for i in range(nstrata):
+        get_depth_stratum(dm.dm, strata_dim[i], &pStart, &pEnd)  # all points of the dimension
+        stratum_type = strata_type[i]
         if not variable:
             ndof = nodes[i, 0]
         for p in range(pStart, pEnd):
+            if stratum_type >= 0:
+                # The dimension holds more than one polytope type, so keep
+                # only the points of this stratum's type.
+                CHKERR(DMPlexGetCellType(dm.dm, p, &celltype))
+                if <PetscInt>celltype != stratum_type:
+                    continue
             if variable:
                 if on_base_:
                     ndof = nodes[i, 1]
@@ -1441,6 +1460,9 @@ def create_section(mesh, nodes_per_entity, on_base=False, block_size=1, boundary
         else:
             factor = 0
         if factor > 0:
+            # "bottom" and "top" exist on an extruded mesh only, and the base
+            # mesh of an extruded mesh has one polytope type per dimension, so
+            # a numbering stratum here is a depth stratum.
             for i in range(dimension + 1):
                 get_depth_stratum(dm.dm, i, &pStart, &pEnd)
                 dof = nodes_per_entity[i, 0]
@@ -2454,6 +2476,103 @@ def mark_entity_classes_using_cell_dm(PETSc.DM swarm):
         CHKERR(DMLabelSetValue(swarm_labels[plex_cell_class], swarmCell, label_value))
     CHKERR(DMSwarmRestoreField(swarm.dm, cellid, &blocksize, &ctype, <void**> &swarmParentCells))
     CHKERR(PetscFree(plex_cell_classes))
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def get_plex_polytope_types(PETSc.DM dm):
+    """Return the DMPlex polytope types of each topological dimension.
+
+    :arg dm: The DM object encapsulating the mesh topology
+    :returns: A tuple with one entry per topological dimension. Entry ``d`` is
+        ``(None,)`` when every plex point of dimension ``d`` has the same
+        polytope type, and otherwise the tuple of the polytope types of that
+        dimension, in increasing order of the type. ``None`` means "every point
+        of the dimension".
+
+    This function is collective. A process that holds no point of a given
+    polytope type must still agree with the processes that do.
+    """
+    cdef:
+        PetscInt depth, d, p, pStart, pEnd
+        np.ndarray found, found_all
+        PetscDMPolytopeType celltype
+
+    depth = get_topological_dimension(dm) + 1
+    if isinstance(dm, PETSc.DMSwarm):
+        # A swarm has no plex points and no cell types.
+        return ((None,), ) * depth
+    found = np.zeros((depth, DM_NUM_POLYTOPES), dtype=IntType)
+    found_all = np.zeros((depth, DM_NUM_POLYTOPES), dtype=IntType)
+    for d in range(depth):
+        get_depth_stratum(dm.dm, d, &pStart, &pEnd)
+        for p in range(pStart, pEnd):
+            CHKERR(DMPlexGetCellType(dm.dm, p, &celltype))
+            found[d, celltype] = 1
+    dm.comm.tompi4py().Allreduce(found, found_all, op=MPI.MAX)
+    types = []
+    for d in range(depth):
+        present = tuple(t for t in range(DM_NUM_POLYTOPES) if found_all[d, t])
+        types.append((None, ) if len(present) < 2 else present)
+    return tuple(types)
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def get_entity_classes_per_stratum(PETSc.DM dm,
+                                   np.ndarray strata_dims,
+                                   np.ndarray strata_types):
+    """Builds PyOP2 entity class offsets for each numbering stratum.
+
+    :arg dm: The DM object encapsulating the mesh topology
+    :arg strata_dims: The topological dimension of each numbering stratum
+    :arg strata_types: The DMPlex polytope type of each numbering stratum, or
+        -1 to take every point of the dimension
+    :returns: An (nstrata, 3) array of cumulative core / owned / ghost counts
+
+    This is get_entity_classes, refined from a depth stratum to a numbering
+    stratum. It gives the same answer as get_entity_classes when every entry of
+    strata_types is -1.
+    """
+    cdef:
+        np.ndarray entity_class_sizes
+        np.ndarray eStart, eEnd
+        PetscInt nstrata, s, i, ci, class_size, start, end, point
+        const PetscInt *indices = NULL
+        PETSc.IS class_is
+        PetscDMPolytopeType celltype
+
+    nstrata = strata_dims.shape[0]
+    entity_class_sizes = np.zeros((nstrata, 3), dtype=IntType)
+    eStart = np.zeros(nstrata, dtype=IntType)
+    eEnd = np.zeros(nstrata, dtype=IntType)
+    for s in range(nstrata):
+        get_depth_stratum(dm.dm, strata_dims[s], &start, &end)
+        eStart[s] = start
+        eEnd[s] = end
+
+    for i, op2class in enumerate([b"pyop2_core",
+                                  b"pyop2_owned",
+                                  b"pyop2_ghost"]):
+        class_is = dm.getStratumIS(op2class, 1)
+        class_size = dm.getStratumSize(op2class, 1)
+        if class_size > 0:
+            CHKERR(ISGetIndices(class_is.iset, &indices))
+            for ci in range(class_size):
+                point = indices[ci]
+                CHKERR(DMPlexGetCellType(dm.dm, point, &celltype))
+                for s in range(nstrata):
+                    if eStart[s] <= point < eEnd[s] and \
+                            (strata_types[s] < 0 or strata_types[s] == <PetscInt>celltype):
+                        entity_class_sizes[s, i] += 1
+                        break
+            CHKERR(ISRestoreIndices(class_is.iset, &indices))
+
+    # PyOP2 entity class indices are additive
+    for s in range(nstrata):
+        for i in range(1, 3):
+            entity_class_sizes[s, i] += entity_class_sizes[s, i-1]
+    return entity_class_sizes
 
 
 @cython.boundscheck(False)

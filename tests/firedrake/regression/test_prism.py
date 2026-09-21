@@ -4,15 +4,17 @@ The meshes come from ``prism_meshes/`` at the repository root. They hold
 ``DM_POLYTOPE_TRI_PRISM`` cells, which is the only prism cell type that this
 code supports. Facet integrals (``ds``) are not part of these tests.
 
-Two gaps stop a prism mesh above degree 1. Each one has an xfail test below
-that turns green when a later task closes the gap.
+Two gaps stopped a prism mesh above degree 1. Task 2b closed the first one. The
+second one still has an xfail test below that turns green when Task 2c closes it.
 
-Gap 1, Task 2b, the global numbering. ``create_section`` gives every plex point of the
-same topological dimension the same number of dofs. The dimension 2 points of
-a prism mesh are not uniform: the quadrilateral faces and the triangular faces
-carry different dof counts. The triangular faces therefore get a dof block
-sized for a quadrilateral, and the surplus dofs are never referenced. A
-stiffness matrix then has one empty row per triangular face and is singular.
+Gap 1, Task 2b, the global numbering. CLOSED. ``create_section`` used to give
+every plex point of the same topological dimension the same number of dofs. The
+dimension 2 points of a prism mesh are not uniform: the quadrilateral faces and
+the triangular faces carry different dof counts. The triangular faces therefore
+got a dof block sized for a quadrilateral, the surplus dofs were never
+referenced, and a stiffness matrix had one empty row per triangular face and was
+singular. The numbering now keys the dof count on the DMPlex polytope type of the
+point. See ``_numbering_strata`` in ``firedrake/mesh.py``. CG2 works from here.
 
 Gap 2, Task 2c, the orientation of a quadrilateral face. ``_compute_orientation``
 reports orientation 4 or 6 for every quadrilateral face of a prism, that is
@@ -284,13 +286,8 @@ def test_prism_interpolation_is_exact_on_one_cell(degree):
 
 # ------------------------------------------------------------------- Poisson
 
-@pytest.mark.parametrize("degree", [
-    1,
-    pytest.param(2, marks=pytest.mark.xfail(
-        strict=True, reason="Task 2b, gap 1: the section over-allocates the "
-                            "triangular faces, so the stiffness matrix is "
-                            "singular")),
-])
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("degree", [1, 2])
 def test_prism_poisson_with_strong_dirichlet(degree):
     """A harmonic polynomial of the FE space is reproduced exactly."""
     mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
@@ -309,18 +306,121 @@ def test_prism_poisson_with_strong_dirichlet(degree):
     assert error < 1e-10
 
 
-# --------------------------------------------------------- the two known gaps
+# --------------------------------------------------- the dof numbering, gap 1
 
-@pytest.mark.xfail(strict=True, reason="Task 2b, gap 1: create_section gives "
-                                       "every dimension 2 point the dof count "
-                                       "of a quadrilateral face")
-@pytest.mark.parametrize("degree", [2, 3])
-def test_prism_function_space_has_no_unreferenced_dofs(degree):
+# The plex entity counts of prism_slab.msh. test_prism_slab_entity_counts below
+# checks them against the mesh itself.
+SLAB_VERTICES = 60
+SLAB_EDGES = 175
+SLAB_TRIANGLES = 78
+SLAB_QUADRILATERALS = 90
+SLAB_CELLS = 52
+
+
+def _expected_cg_dim(degree):
+    """The dimension of the CG space of the given degree on prism_slab.msh.
+
+    The interior dof counts of a degree k prism Lagrange space are k-1 on an
+    edge, whether it is an axis edge or a base edge, (k-1)(k-2)/2 on a
+    triangular face, (k-1)^2 on a quadrilateral face, and (k-1)(k-2)/2 * (k-1)
+    in the cell, which is the triangle interior count times the interval
+    interior count.
+    """
+    edge = degree - 1
+    triangle = (degree - 1) * (degree - 2) // 2
+    quadrilateral = (degree - 1) ** 2
+    cell = triangle * (degree - 1)
+    return (SLAB_VERTICES
+            + SLAB_EDGES * edge
+            + SLAB_TRIANGLES * triangle
+            + SLAB_QUADRILATERALS * quadrilateral
+            + SLAB_CELLS * cell)
+
+
+def test_prism_slab_entity_counts():
+    """The constants above are the plex entity counts of prism_slab.msh."""
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    plex = mesh.topology.topology_dm
+    counts = {}
+    for dim in range(4):
+        start, end = plex.getDepthStratum(dim)
+        for point in range(start, end):
+            cell_type = plex.getCellType(point)
+            counts[cell_type] = counts.get(cell_type, 0) + 1
+    assert counts == {
+        PETSc.DM.PolytopeType.POINT: SLAB_VERTICES,
+        PETSc.DM.PolytopeType.SEGMENT: SLAB_EDGES,
+        PETSc.DM.PolytopeType.TRIANGLE: SLAB_TRIANGLES,
+        PETSc.DM.PolytopeType.QUADRILATERAL: SLAB_QUADRILATERALS,
+        PETSc.DM.PolytopeType.TRI_PRISM: SLAB_CELLS,
+    }
+
+
+def test_prism_numbering_strata_split_dimension_two():
+    """Dimension 2 supplies one numbering stratum per polytope type."""
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    topology = mesh.topology
+    assert topology._numbering_strata == (
+        (0, None),
+        (1, None),
+        (2, PETSc.DM.PolytopeType.TRIANGLE),
+        (2, PETSc.DM.PolytopeType.QUADRILATERAL),
+        (3, None),
+    )
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("degree", [1, 2, 3, 4])
+def test_prism_function_space_dimension(degree):
+    """V.dim() is the analytic dof count, at every degree."""
     mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
     V = FunctionSpace(mesh, "CG", degree)
-    referenced = np.unique(V.cell_node_map().values).size
-    assert referenced == V.dim()
+    assert V.dim() == _expected_cg_dim(degree)
 
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("degree", [1, 2, 3, 4])
+def test_prism_dofs_per_plex_entity(degree):
+    """One dof count per numbering stratum, in stratum order."""
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    V = FunctionSpace(mesh, "CG", degree)
+    got = tuple(mesh.topology.make_dofs_per_plex_entity(
+        V.finat_element.entity_dofs()))
+    assert got == (1,
+                   degree - 1,
+                   (degree - 1) * (degree - 2) // 2,
+                   (degree - 1) ** 2,
+                   (degree - 1) * (degree - 2) // 2 * (degree - 1))
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("degree", [2, 3])
+def test_prism_function_space_has_no_unreferenced_dofs(degree):
+    """Every node of the space is referenced by the cell node map."""
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    V = FunctionSpace(mesh, "CG", degree)
+    local = np.unique(V.cell_node_map().values)
+    referenced = V.dof_dset.lgmap.indices[local]
+    gathered = np.concatenate(mesh.comm.allgather(referenced))
+    assert np.unique(gathered).size == V.dim()
+
+
+@pytest.mark.parallel([1, 2, 3])
+def test_prism_cg2_mass_matrix_has_no_empty_row():
+    """A CG2 mass matrix on a prism mesh is not singular.
+
+    One empty row per triangular face was the visible symptom of gap 1.
+    """
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    V = FunctionSpace(mesh, "CG", 2)
+    matrix = assemble(inner(TrialFunction(V), TestFunction(V)) * dx).M.handle
+    start, end = matrix.getOwnershipRange()
+    empty = [row for row in range(start, end)
+             if matrix.getRow(row)[0].size == 0]
+    assert empty == []
+
+
+# ---------------------------------------------------------- the known gap, 2
 
 @pytest.mark.xfail(strict=True, reason="Task 2c, gap 2: PETSc transposes the "
                                        "axes of a TRI_PRISM quadrilateral face "
