@@ -7,14 +7,14 @@ code supports. Facet integrals (``ds``) are not part of these tests.
 Two gaps stop a prism mesh above degree 1. Each one has an xfail test below
 that turns green when a later task closes the gap.
 
-Gap 1, the global numbering. ``create_section`` gives every plex point of the
+Gap 1, Task 2b, the global numbering. ``create_section`` gives every plex point of the
 same topological dimension the same number of dofs. The dimension 2 points of
 a prism mesh are not uniform: the quadrilateral faces and the triangular faces
 carry different dof counts. The triangular faces therefore get a dof block
 sized for a quadrilateral, and the surplus dofs are never referenced. A
 stiffness matrix then has one empty row per triangular face and is singular.
 
-Gap 2, the orientation of a quadrilateral face. ``_compute_orientation``
+Gap 2, Task 2c, the orientation of a quadrilateral face. ``_compute_orientation``
 reports orientation 4 or 6 for every quadrilateral face of a prism, that is
 ``eo = 1``: PETSc orders the cone of a TRI_PRISM quadrilateral face with its
 axes transposed against the UFCQuadrilateral convention. The FInAT prism
@@ -207,22 +207,36 @@ def test_prism_cell_orientation_is_zero(meshname):
 
 # ------------------------------------------------------------------ assembly
 
-GAP2_UNSAFE = (
+_GAP2_UNSAFE_HEAD = (
     "Task 2c, gap 2. DO NOT DELETE THIS SKIP AS MERELY UNSUPPORTED. The test "
     "PASSES today, but only because an out-of-bounds read returned 0 in this "
     "build. At CG2 and above a quadrilateral face carries dofs, so "
     "get_cell_nodes indexes the permutation table past its end under "
     "boundscheck(False): at CG2 the read is index 36 of a 36 element array. "
-    "The assertion can not detect the defect either, because a mass matrix "
-    "total equals the cell volume even when dofs land on the wrong entity. "
-    "Re-enable this when gap 2 is closed."
+)
+_GAP2_UNSAFE_TAIL = " Re-enable this when gap 2 is closed."
+
+GAP2_UNSAFE_MASS = (
+    _GAP2_UNSAFE_HEAD
+    + "The assertion can not detect the defect either, because a mass matrix "
+      "total equals the cell volume even when dofs land on the wrong entity."
+    + _GAP2_UNSAFE_TAIL
+)
+
+GAP2_UNSAFE_INTERP = (
+    _GAP2_UNSAFE_HEAD
+    + "This case asserts an L2 interpolation error, which CAN detect the "
+      "defect, and does so from CG3 upwards, where those two cases are strict "
+      "xfails. At CG2 a quadrilateral face carries one dof, so the defect "
+      "stays invisible to the assertion as long as the read returns 0."
+    + _GAP2_UNSAFE_TAIL
 )
 
 
 @pytest.mark.parametrize("degree", [
     1,
-    pytest.param(2, marks=pytest.mark.skip(reason=GAP2_UNSAFE)),
-    pytest.param(3, marks=pytest.mark.skip(reason=GAP2_UNSAFE)),
+    pytest.param(2, marks=pytest.mark.skip(reason=GAP2_UNSAFE_MASS)),
+    pytest.param(3, marks=pytest.mark.skip(reason=GAP2_UNSAFE_MASS)),
 ])
 def test_prism_mass_matrix_total_is_the_volume(degree):
     mesh = Mesh(str(MESHDIR / "prism_reference.msh"))
@@ -249,7 +263,7 @@ def test_prism_slab_volume_from_the_gmsh_geometry():
 
 @pytest.mark.parametrize("degree", [
     1,
-    pytest.param(2, marks=pytest.mark.skip(reason=GAP2_UNSAFE)),
+    pytest.param(2, marks=pytest.mark.skip(reason=GAP2_UNSAFE_INTERP)),
     pytest.param(3, marks=pytest.mark.xfail(
         strict=True, reason="Task 2c, gap 2: the quadrilateral face orientation "
                             "is out of the range the FInAT prism element supplies")),
@@ -273,8 +287,9 @@ def test_prism_interpolation_is_exact_on_one_cell(degree):
 @pytest.mark.parametrize("degree", [
     1,
     pytest.param(2, marks=pytest.mark.xfail(
-        strict=True, reason="gap 1: the section over-allocates the triangular "
-                            "faces, so the stiffness matrix is singular")),
+        strict=True, reason="Task 2b, gap 1: the section over-allocates the "
+                            "triangular faces, so the stiffness matrix is "
+                            "singular")),
 ])
 def test_prism_poisson_with_strong_dirichlet(degree):
     """A harmonic polynomial of the FE space is reproduced exactly."""
@@ -296,9 +311,9 @@ def test_prism_poisson_with_strong_dirichlet(degree):
 
 # --------------------------------------------------------- the two known gaps
 
-@pytest.mark.xfail(strict=True, reason="gap 1: create_section gives every "
-                                       "dimension 2 point the dof count of a "
-                                       "quadrilateral face")
+@pytest.mark.xfail(strict=True, reason="Task 2b, gap 1: create_section gives "
+                                       "every dimension 2 point the dof count "
+                                       "of a quadrilateral face")
 @pytest.mark.parametrize("degree", [2, 3])
 def test_prism_function_space_has_no_unreferenced_dofs(degree):
     mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
