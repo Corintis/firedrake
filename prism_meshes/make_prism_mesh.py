@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Generate gmsh prism meshes for the Firedrake prism smoke test.
 
-Produces three files in this directory:
+Produces six files in this directory:
 
   prism_reference.msh one prism whose vertices are the FIAT reference prism.
                    Written by hand, because gmsh will not place a single prism
@@ -15,6 +15,17 @@ Produces three files in this directory:
                    so that no prism is affine and the axes tilt. The mesh file
                    records no extrusion structure, so Firedrake must treat it
                    as a fully unstructured prism mesh.
+
+  prism_order_r0.msh, prism_order_r1.msh, prism_order_r2.msh
+                   a refinement sequence for the convergence order test. Each
+                   level halves the element size in every direction, so the
+                   ratio of the mesh sizes is exactly 2 and the measured order
+                   is not polluted by an uneven refinement. The base
+                   triangulation is transfinite for that reason: a Delaunay
+                   triangulation at half the target size does not halve the
+                   in-plane element size, and the observed order then sits far
+                   from the theoretical one. The warp of prism_warped.msh is
+                   applied to every level, so no prism is affine.
 
 Physical groups:
   volume 1        the prism cells
@@ -34,8 +45,12 @@ H = 0.6          # slab height
 NLAYERS = 2      # prism layers
 LC = 0.45        # in-plane target element size
 
+# The convergence sequence: (in-plane divisions per side, prism layers) per
+# level. Every level doubles both, so the element size halves exactly.
+ORDER_LEVELS = ((4, 2), (8, 4), (16, 8))
 
-def build(path, warp):
+
+def build(path, warp, divisions=None, nlayers=NLAYERS):
     gmsh.initialize()
     gmsh.option.setNumber("General.Terminal", 0)
     gmsh.model.add("prisms")
@@ -48,13 +63,21 @@ def build(path, warp):
     loop = gmsh.model.geo.addCurveLoop(lines)
     surf = gmsh.model.geo.addPlaneSurface([loop])
 
+    if divisions is not None:
+        # A transfinite base, for the convergence sequence only. "Alternate"
+        # flips the diagonal from one quadrilateral to the next, so the
+        # triangles do not all share one orientation.
+        for line in lines:
+            gmsh.model.geo.mesh.setTransfiniteCurve(line, divisions + 1)
+        gmsh.model.geo.mesh.setTransfiniteSurface(surf, "Alternate")
+
     # recombine=True is required, and the name is misleading. It recombines
     # the SIDE surfaces into quadrilaterals. The base stays triangular, because
     # a triangle has nothing to recombine with. The result is prisms.
     # With recombine=False gmsh splits the side quads into triangles, and then
     # meshes the volume with tetrahedra instead. Verified: 156 tets, 0 prisms.
     ext = gmsh.model.geo.extrude([(2, surf)], 0, 0, H,
-                                 numElements=[NLAYERS], recombine=True)
+                                 numElements=[nlayers], recombine=True)
     vol = [e[1] for e in ext if e[0] == 3]
     top = [e[1] for e in ext if e[0] == 2][0]
     sides = [e[1] for e in ext if e[0] == 2][1:]
@@ -120,6 +143,13 @@ if __name__ == "__main__":
         path = os.path.join(HERE, name)
         types = build(path, warp)
         # gmsh element type 6 is the 6-node prism.
+        kind = f"{types[6]} prisms (gmsh type 6), no other cell type" \
+            if set(types) == {6} else f"WRONG: {types}"
+        print(f"{name:<20} 3D element types: {kind}")
+    for level, (divisions, nlayers) in enumerate(ORDER_LEVELS):
+        name = f"prism_order_r{level}.msh"
+        path = os.path.join(HERE, name)
+        types = build(path, True, divisions=divisions, nlayers=nlayers)
         kind = f"{types[6]} prisms (gmsh type 6), no other cell type" \
             if set(types) == {6} else f"WRONG: {types}"
         print(f"{name:<20} 3D element types: {kind}")
