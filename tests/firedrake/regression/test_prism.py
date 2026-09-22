@@ -240,6 +240,20 @@ argument fails, and the result is wrong as well. The CG3 and CG4 cases below are
 strict xfails for exactly that reason.
 """
 
+CG3_RESULT_IS_UNVERIFIED = (
+    "Task 2c, gap 2. DO NOT DELETE THIS SKIP AS MERELY UNSUPPORTED. The test "
+    "PASSES today, and that is why it is skipped. This is NOT the CG2 case "
+    "above. At CG2 a quadrilateral face carries one dof, the only permutation "
+    "of a one element set is the identity, and the result is therefore correct "
+    "for a structural reason. At CG3 a quadrilateral face carries 4 dofs, the "
+    "FInAT element supplies only the 4 orientations with extrinsic part 0, and "
+    "the shipped prism meshes present the values 4 and 6 as well. The "
+    "permutation then selects between genuinely different answers. So at CG3 "
+    "the read in get_cell_nodes is out of bounds AND the result it produces is "
+    "unverified: this test passes on a memory layout accident, not for a "
+    "reason. Re-enable it when gap 2 is closed."
+)
+
 GAP2_UNSAFE_MASS = (
     _GAP2_UNSAFE_HEAD
     + "The assertion can not detect the defect either, because a mass matrix "
@@ -423,7 +437,10 @@ def test_prism_dofs_per_plex_entity(degree):
 
 
 @pytest.mark.parallel([1, 2, 3])
-@pytest.mark.parametrize("degree", [2, 3])
+@pytest.mark.parametrize("degree", [
+    2,
+    pytest.param(3, marks=pytest.mark.skip(reason=CG3_RESULT_IS_UNVERIFIED)),
+])
 def test_prism_function_space_has_no_unreferenced_dofs(degree):
     """Every node of the space is referenced by the cell node map."""
     mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
