@@ -438,6 +438,8 @@ def _physical_dof_points(mesh, V):
     reference = _reference_dof_points(V)
     coordinates = mesh.coordinates
     vertex_map = coordinates.function_space().cell_node_map().values
+    # The map below is the degree 1 one, so the coordinate field must be too.
+    assert vertex_map.shape[1] == 6
     data = coordinates.dat.data_ro_with_halos
     x, y, z = reference[:, 0], reference[:, 1], reference[:, 2]
     # Barycentric coordinates on the triangle factor.
@@ -489,6 +491,10 @@ def _assert_shared_face_dofs_agree(meshname, degree, columns, dofs_per_face):
             continue
         nodes_a = [int(nodes[cell_a, dof]) for dof in dofs_a]
         nodes_b = [int(nodes[cell_b, dof]) for dof in dofs_b]
+        # A face that reads the wrong block of the permutation table gives the
+        # same node to several of its dofs, so check for that before the sets.
+        assert len(set(nodes_a)) == len(nodes_a)
+        assert len(set(nodes_b)) == len(nodes_b)
         assert sorted(nodes_a) == sorted(nodes_b)
         # The node that each cell puts at a given physical point is the same.
         place_a = {node: points[cell_a, dof] for node, dof in zip(nodes_a, dofs_a)}
