@@ -1360,6 +1360,14 @@ def test_hexahedron_plex_dg_coordinates_are_in_closure_order():
 # DM_POLYTOPE_TRI_PRISM_TENSOR, and the PETSc default picks the tensor type,
 # which Firedrake does not support. firedrake/checkpointing.py calls
 # dmcommon.relabel_tensor_prisms after topologyLoad to correct that.
+#
+# CAUTION. These tests cover prism checkpointing. They are NOT evidence about
+# the PETSc DG1 permutation, and no review may cite them as such. A round trip
+# applies the permutation table in both directions, so a wrong table cancels
+# itself. This is measured, not argued: with perm set to 0, 3, 1, 5, 4, 2 every
+# test below still passed, while test_prism_dg_permutation_table and
+# test_prism_plex_dg_coordinates_are_in_closure_order failed on all four prism
+# meshes. The second of those is the test that covers the permutation.
 
 CHECKPOINT_MESH_NAME = "prism_checkpoint_mesh"
 
