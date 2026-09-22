@@ -35,10 +35,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from firedrake import (Constant, DirichletBC, ExtrudedMesh, Function,
-                       FunctionSpace, Mesh, SpatialCoordinate, TestFunction,
-                       TrialFunction, UnitCubeMesh, UnitSquareMesh, VTKFile,
-                       assemble, dx, grad, inner, solve)
+from firedrake import (CellDiameter, Constant, DirichletBC, ExtrudedMesh,
+                       Function, FunctionSpace, Mesh, PointNotInDomainError,
+                       PointEvaluator, SpatialCoordinate, TestFunction,
+                       TestFunctions, TrialFunction, TrialFunctions,
+                       UnitCubeMesh, UnitSquareMesh, VectorFunctionSpace,
+                       VertexOnlyMeshMissingPointsError, VTKFile, as_vector,
+                       assemble, cos, div, dx, exp, grad, inner, pi, sin,
+                       solve)
 from firedrake.petsc import PETSc
 
 
@@ -268,7 +272,7 @@ def test_prism_interpolation_is_exact_on_one_cell(degree):
 # ------------------------------------------------------------------- Poisson
 
 @pytest.mark.parallel([1, 2, 3])
-@pytest.mark.parametrize("degree", [1, 2, 3])
+@pytest.mark.parametrize("degree", [1, 2, 3, 4])
 def test_prism_poisson_with_strong_dirichlet(degree):
     """A harmonic polynomial of the FE space is reproduced exactly."""
     mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
@@ -1492,3 +1496,374 @@ def test_prism_checkpoint_load_agrees_with_the_cell_type_label(tmp_path):
     for c in range(cStart, cEnd):
         assert dm.getCellType(c) == PETSc.DM.PolytopeType.TRI_PRISM
         assert label.getValue(c) == int(PETSc.DM.PolytopeType.TRI_PRISM)
+
+
+# -------------------------------------------------------- mixed function spaces
+#
+# A mixed space stacks the dofs of its subspaces into one vector. Every
+# subspace keeps its own local numbering, and the offset that separates the
+# fields lives in the local to global map of the mixed dof dataset. The tests
+# below check that offset, and then solve a coupled system that is only exact
+# if the offset is right.
+
+MIXED_DEGREES = ((2, 1), (3, 2))
+
+
+def _mixed_field_offsets(W):
+    """The start of each field inside the local vector of a mixed space.
+
+    :arg W: A mixed :class:`~.FunctionSpace`.
+    :returns: A pair (starts, owned). starts[f] is the first local index of
+        field f. owned[f] is the number of dofs of field f that this rank owns.
+        The local block of a field holds its owned dofs first, then its halo.
+    """
+    total = [W.dof_dset[f].total_size for f in range(len(W))]
+    owned = [W.dof_dset[f].size for f in range(len(W))]
+    starts = np.concatenate([[0], np.cumsum(total)[:-1]]).astype(int)
+    return starts, owned
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("degrees", MIXED_DEGREES)
+def test_prism_mixed_function_space_dimension(degrees):
+    """W.dim() is the sum of the dimensions of the subspaces."""
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    V = FunctionSpace(mesh, "CG", degrees[0])
+    Q = FunctionSpace(mesh, "CG", degrees[1])
+    W = V * Q
+    assert W.dim() == V.dim() + Q.dim()
+    assert W.dim() == _expected_cg_dim(degrees[0]) + _expected_cg_dim(degrees[1])
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("degrees", MIXED_DEGREES)
+def test_prism_mixed_owned_dofs_are_one_contiguous_block_per_field(degrees):
+    """The owned dofs of the fields sit next to each other, in field order.
+
+    A rank owns one contiguous block of the global vector. Field 0 takes the
+    front of that block and field 1 follows it. An offset that counted the
+    halo, or that counted the other field twice, moves the second field.
+    """
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    V = FunctionSpace(mesh, "CG", degrees[0])
+    Q = FunctionSpace(mesh, "CG", degrees[1])
+    W = V * Q
+    comm = mesh.comm
+    starts, owned = _mixed_field_offsets(W)
+    lgmap = W.dof_dset.lgmap.indices
+    # The first global index this rank owns, over both fields.
+    base = comm.scan(sum(owned)) - sum(owned)
+    expected = base
+    for field in range(len(W)):
+        block = lgmap[starts[field]:starts[field] + owned[field]]
+        assert np.array_equal(block, expected + np.arange(owned[field]))
+        expected += owned[field]
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("degrees", MIXED_DEGREES)
+def test_prism_mixed_cell_node_map_reaches_every_dof_once(degrees):
+    """The cell node maps of the subspaces, offset, cover the mixed space.
+
+    Each subspace map holds its own local node numbers. The global index of
+    one of them is lgmap[start of the field + local node]. Over all cells and
+    all ranks those global indices must be exactly 0 to W.dim() - 1. A wrong
+    offset either leaves a gap or makes two fields collide, and both show up
+    here.
+    """
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    V = FunctionSpace(mesh, "CG", degrees[0])
+    Q = FunctionSpace(mesh, "CG", degrees[1])
+    W = V * Q
+    starts, _ = _mixed_field_offsets(W)
+    lgmap = W.dof_dset.lgmap.indices
+    submaps = list(W.cell_node_map())
+    # The subspace maps are the maps of the standalone spaces. The offset is
+    # not folded into them.
+    assert np.array_equal(submaps[0].values, V.cell_node_map().values)
+    assert np.array_equal(submaps[1].values, Q.cell_node_map().values)
+    reached = np.concatenate([
+        lgmap[starts[field] + np.unique(submaps[field].values)]
+        for field in range(len(W))
+    ])
+    gathered = np.concatenate(mesh.comm.allgather(reached))
+    assert np.unique(gathered).size == W.dim()
+    assert gathered.min() == 0
+    assert gathered.max() == W.dim() - 1
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("degrees", MIXED_DEGREES)
+def test_prism_mixed_poisson_is_exact(degrees):
+    """A coupled two field system reproduces a solution of the mixed space.
+
+    The system is
+
+        (grad u, grad v) + (p, v) = (f, v)
+        (u, q) - (p, q)           = (g, q)
+
+    with f = -div(grad(u)) + p and g = u - p. Both exact fields are
+    polynomials of the corresponding space, so the discrete solution is the
+    exact one. The block is [[A, M], [M, -M]], which is invertible, so the
+    solution is unique and the comparison is meaningful.
+    """
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    V = FunctionSpace(mesh, "CG", degrees[0])
+    Q = FunctionSpace(mesh, "CG", degrees[1])
+    W = V * Q
+    x, y, z = SpatialCoordinate(mesh)
+    u_exact = 1.0 + x + 2.0 * y + x**2 + y**2 - 2.0 * z**2
+    p_exact = 1.0 + 2.0 * x - y + 0.5 * z
+    f = -div(grad(u_exact)) + p_exact
+    g = u_exact - p_exact
+    u, p = TrialFunctions(W)
+    v, q = TestFunctions(W)
+    a = (inner(grad(u), grad(v)) * dx + inner(p, v) * dx
+         + inner(u, q) * dx - inner(p, q) * dx)
+    L = inner(f, v) * dx + inner(g, q) * dx
+    w = Function(W)
+    bc = DirichletBC(W.sub(0), u_exact, "on_boundary")
+    solve(a == L, w, bcs=[bc],
+          solver_parameters={"ksp_type": "preonly", "pc_type": "lu",
+                             "mat_type": "aij"})
+    uh, ph = w.subfunctions
+    u_error = float(np.sqrt(abs(assemble(inner(uh - u_exact,
+                                               uh - u_exact) * dx))))
+    p_error = float(np.sqrt(abs(assemble(inner(ph - p_exact,
+                                               ph - p_exact) * dx))))
+    assert u_error < 1e-10
+    assert p_error < 1e-10
+
+
+@pytest.mark.parallel([1, 2, 3])
+def test_prism_mixed_vector_scalar_system_is_exact():
+    """A Stokes like system on a vector subspace and a scalar subspace.
+
+    The first field is a vector space, so its subspace carries three dofs per
+    node and the field offset is not the node count. The pressure block is
+    -(p, q), which keeps the system invertible for any element pair, so the
+    test measures the prism and not the inf-sup constant of the pair.
+    """
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    V = VectorFunctionSpace(mesh, "CG", 2)
+    Q = FunctionSpace(mesh, "CG", 1)
+    W = V * Q
+    assert W.dim() == 3 * _expected_cg_dim(2) + _expected_cg_dim(1)
+    x, y, z = SpatialCoordinate(mesh)
+    u_exact = as_vector([x * y - z**2, y * z + x**2, x * z - y**2])
+    p_exact = 1.0 + 2.0 * x - y + 0.5 * z
+    f = -div(grad(u_exact)) - grad(p_exact)
+    g = div(u_exact) - p_exact
+    u, p = TrialFunctions(W)
+    v, q = TestFunctions(W)
+    a = (inner(grad(u), grad(v)) * dx + inner(p, div(v)) * dx
+         + inner(div(u), q) * dx - inner(p, q) * dx)
+    L = inner(f, v) * dx + inner(g, q) * dx
+    w = Function(W)
+    bc = DirichletBC(W.sub(0), u_exact, "on_boundary")
+    solve(a == L, w, bcs=[bc],
+          solver_parameters={"ksp_type": "preonly", "pc_type": "lu",
+                             "mat_type": "aij"})
+    uh, ph = w.subfunctions
+    u_error = float(np.sqrt(abs(assemble(inner(uh - u_exact,
+                                               uh - u_exact) * dx))))
+    p_error = float(np.sqrt(abs(assemble(inner(ph - p_exact,
+                                               ph - p_exact) * dx))))
+    assert u_error < 1e-10
+    assert p_error < 1e-10
+
+
+# ---------------------------------------------------------- convergence order
+#
+# Every other solver test on a prism asks for exactness: the exact solution is
+# a member of the finite element space, so the discrete solution reproduces it
+# and the error is zero. Exactness does not see a geometry error or a
+# quadrature error that is itself exact on the space. The order of convergence
+# for a solution OUTSIDE the space does see both, so the tests below refine a
+# sequence of meshes and measure that order.
+#
+# The meshes are warped, so no prism is affine and the Jacobian varies inside
+# every cell. Their element size halves exactly from one level to the next;
+# see prism_meshes/make_prism_mesh.py for why that matters.
+
+ORDER_MESHNAMES = ("prism_order_r0.msh", "prism_order_r1.msh",
+                   "prism_order_r2.msh")
+
+
+def _poisson_order_step(meshname, degree):
+    """Solve Poisson for a non-polynomial solution on one mesh of the sequence.
+
+    :arg meshname: The file name of the mesh.
+    :arg degree: The degree of the CG space.
+    :returns: A pair (h, error). h is the largest cell diameter of the mesh.
+        error is the L2 norm of the difference from the exact solution.
+
+    The exact solution is smooth and is not a polynomial, so it is in no CG
+    space of the sequence. The right hand side is its own Laplacian, and the
+    boundary condition is the exact solution itself, so the exact solution of
+    the continuous problem is the same on every mesh of the sequence even
+    though the meshes describe slightly different polyhedra.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    V = FunctionSpace(mesh, "CG", degree)
+    x, y, z = SpatialCoordinate(mesh)
+    exact = sin(pi * x) * cos(pi * y) * exp(z)
+    f = -div(grad(exact))
+    u = Function(V)
+    v = TestFunction(V)
+    bc = DirichletBC(V, exact, "on_boundary")
+    solve(inner(grad(u), grad(v)) * dx - inner(f, v) * dx == 0, u, bcs=bc,
+          solver_parameters={"ksp_type": "preonly", "pc_type": "lu"})
+    error = float(np.sqrt(abs(assemble(inner(u - exact, u - exact) * dx))))
+    diameters = Function(FunctionSpace(mesh, "DG", 0))
+    diameters.interpolate(CellDiameter(mesh))
+    h = float(diameters.dat.data_ro.max())
+    return h, error
+
+
+@pytest.mark.parametrize("degree", [1, 2, 3])
+def test_prism_poisson_converges_at_the_expected_order(degree):
+    """The L2 error of a CG space of degree k falls as h to the power k+1."""
+    steps = [_poisson_order_step(name, degree) for name in ORDER_MESHNAMES]
+    orders = []
+    for (h_coarse, e_coarse), (h_fine, e_fine) in zip(steps[:-1], steps[1:]):
+        assert e_fine < e_coarse
+        orders.append(np.log(e_coarse / e_fine) / np.log(h_coarse / h_fine))
+    # The lower bound is the test. The upper bound catches an error that
+    # collapsed into round-off instead of converging.
+    for order in orders:
+        assert degree + 1 - 0.3 < order < degree + 1 + 0.5, \
+            f"degree {degree} orders {orders} from {steps}"
+
+
+# ----------------------------------------------------- point location, .at
+#
+# Point location asks a different question of the cell than assembly does. It
+# inverts the coordinate map of the cell, so it needs the reference cell of a
+# prism, its bounding box in the rtree, and a rule that says whether a
+# reference point is inside. None of that is exercised by an integral.
+
+# The vertices of a prism in FIAT order. The element is a tensor product, so
+# vertex i is triangle vertex i // 2 at interval vertex i % 2.
+# test_prism_reference_vertices_are_in_tensor_product_order pins this.
+PRISM_TRIANGULAR_FACE_VERTICES = ((0, 2, 4), (1, 3, 5))
+PRISM_QUADRILATERAL_FACE_VERTICES = ((0, 1, 2, 3), (2, 3, 4, 5), (0, 1, 4, 5))
+PRISM_EDGE_VERTICES = ((0, 1), (2, 3), (4, 5),
+                       (0, 2), (2, 4), (0, 4),
+                       (1, 3), (3, 5), (1, 5))
+PRISM_VERTEX_GROUPS = (PRISM_TRIANGULAR_FACE_VERTICES
+                       + PRISM_QUADRILATERAL_FACE_VERTICES
+                       + PRISM_EDGE_VERTICES
+                       + tuple((i,) for i in range(6)))
+
+# How far a probe point moves from the centre of the cell towards a face, an
+# edge or a vertex of it. 0.98 puts the point close to the boundary of the
+# cell and keeps it inside, on every mesh of MESHNAMES.
+PROBE_WEIGHT = 0.98
+
+
+def _at(function, points, **kwargs):
+    """Function.at, without the warning that it is deprecated.
+
+    Function.at is deprecated in favour of PointEvaluator, but the two are
+    different code paths. at uses the compiled evaluation kernel and the rtree
+    of the mesh. PointEvaluator builds a VertexOnlyMesh. Both are tested here.
+    """
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        return function.at(points, **kwargs)
+
+
+def _cell_vertices(mesh):
+    """The vertex coordinates of every cell, in FIAT order.
+
+    :arg mesh: The mesh.
+    :returns: An array of shape (ncells, 6, gdim).
+    """
+    coordinates = mesh.coordinates
+    cell_nodes = coordinates.function_space().cell_node_map().values
+    return coordinates.dat.data_ro_with_halos[cell_nodes]
+
+
+def _probe_points(vertices):
+    """Interior points of one cell, near its centre, faces, edges and vertices.
+
+    :arg vertices: The (6, gdim) vertex coordinates of the cell.
+    :returns: An array of points inside the cell.
+    """
+    centre = vertices.mean(axis=0)
+    targets = [centre]
+    targets += [vertices[list(group)].mean(axis=0)
+                for group in PRISM_VERTEX_GROUPS]
+    return centre + PROBE_WEIGHT * (np.asarray(targets) - centre)
+
+
+def test_prism_reference_vertices_are_in_tensor_product_order():
+    """Vertex i of a prism is triangle vertex i // 2 at interval vertex i % 2.
+
+    The face and edge groups above read the vertices in that order, so a
+    change to it must fail here rather than move a probe point outside its
+    cell without saying so.
+    """
+    mesh = Mesh(str(MESHDIR / "prism_reference.msh"))
+    triangle = np.array([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0]])
+    expected = np.array([[triangle[i // 2][0], triangle[i // 2][1], i % 2]
+                         for i in range(6)])
+    assert np.allclose(_cell_vertices(mesh)[0], expected)
+
+
+def test_prism_locate_cell_finds_the_cell_of_every_interior_point(meshname):
+    """locate_cell returns the cell that a point of that cell belongs to.
+
+    The points cover the centre of each cell and points at 98 per cent of the
+    way to each face, each edge and each vertex, so a cell whose reference map
+    is inverted wrongly near its boundary is found here.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    vertices = _cell_vertices(mesh)
+    for cell in range(vertices.shape[0]):
+        for point in _probe_points(vertices[cell]):
+            assert mesh.locate_cell(point) == cell, \
+                f"{meshname} cell {cell} point {point}"
+
+
+def test_prism_point_evaluation_is_exact(meshname):
+    """A quadratic is evaluated exactly at interior points of every cell.
+
+    A quadratic of the physical coordinates pulls back into the degree 2 space
+    of a prism, because the coordinate map is degree 1 on the triangle and
+    degree 1 on the interval. The interpolant is therefore the quadratic
+    itself, and point evaluation must return its value.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    V = FunctionSpace(mesh, "CG", 2)
+    x, y, z = SpatialCoordinate(mesh)
+    u = Function(V).interpolate(1.0 + x + 2.0 * y - 0.5 * z + x * y - z * z)
+
+    def exact(p):
+        return 1.0 + p[0] + 2.0 * p[1] - 0.5 * p[2] + p[0] * p[1] - p[2]**2
+
+    vertices = _cell_vertices(mesh)
+    points = np.concatenate([_probe_points(vertices[cell])
+                             for cell in range(vertices.shape[0])])
+    expected = np.array([exact(p) for p in points])
+    assert np.allclose(_at(u, points), expected, rtol=0, atol=1e-12)
+    assert np.allclose(PointEvaluator(mesh, points).evaluate(u), expected,
+                       rtol=0, atol=1e-12)
+
+
+def test_prism_point_evaluation_outside_the_mesh_fails(meshname):
+    """A point outside the mesh is reported, not answered with a number."""
+    mesh = Mesh(str(MESHDIR / meshname))
+    V = FunctionSpace(mesh, "CG", 2)
+    x, y, z = SpatialCoordinate(mesh)
+    u = Function(V).interpolate(x + y + z)
+    outside = np.array([5.0, 5.0, 5.0])
+    assert mesh.locate_cell(outside) is None
+    with pytest.raises(PointNotInDomainError):
+        _at(u, outside)
+    assert _at(u, outside, dont_raise=True) is None
+    with pytest.raises(VertexOnlyMeshMissingPointsError):
+        PointEvaluator(mesh, [outside]).evaluate(u)
