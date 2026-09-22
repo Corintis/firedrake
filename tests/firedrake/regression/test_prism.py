@@ -689,10 +689,19 @@ def test_hexahedron_face_still_supplies_eight_orientations():
 VTK_WEDGE = 13
 VTK_LAGRANGE_WEDGE = 73
 
-# prism_slab.msh has an affine map on every cell, so the degree 1 prism map
-# reproduces the coordinates of a higher degree output exactly. The warped
-# mesh does not, so it carries no exactness claim here.
-AFFINE_MESHNAME = "prism_slab.msh"
+# The mesh that the exactness checks below run on.
+#
+# The rule that makes those checks exact is about DEGREE, not about whether a
+# cell is affine. A gmsh prism mesh carries a degree 1 coordinate field, so x,
+# y and z each lie in P1(triangle) x P1(interval). That space sits inside
+# Pk(triangle) x Pk(interval) for every k >= 1, so interpolating the
+# coordinates into the degree k output space reproduces them exactly. A total
+# degree m monomial is in the degree k space exactly when m <= k. None of that
+# asks whether the cell is warped.
+#
+# This name therefore records a choice, not a necessity. Do not read it as a
+# claim that the warped mesh would fail these checks.
+EXACTNESS_MESHNAME = "prism_slab.msh"
 
 
 def _write_pvd(tmp_path, *functions, name="prism"):
@@ -723,7 +732,10 @@ def _read_vtu(path):
     grid = reader.GetOutput()
 
     points = vtk_to_numpy(grid.GetPoints().GetData())
-    types = vtk_to_numpy(grid.GetCellTypesArray())
+    # GetCellType per cell rather than GetCellTypesArray, which VTK deprecated
+    # at 9.6. These meshes hold tens of cells, so the loop costs nothing.
+    types = np.array([grid.GetCellType(i)
+                      for i in range(grid.GetNumberOfCells())], dtype="uint8")
     connectivity = vtk_to_numpy(grid.GetCells().GetConnectivityArray())
     offsets = vtk_to_numpy(grid.GetCells().GetOffsetsArray())
     sizes = np.diff(offsets)
@@ -743,9 +755,14 @@ def _match_rows(points, table, tol=1e-10):
     """Find the row of table that each row of points sits on.
 
     :arg points: An (n, 3) array.
-    :arg table: An (m, 3) array of distinct points.
+    :arg table: An (m, 3) array of points, which must be distinct.
     :returns: An (n,) array of indices into table.
+
+    The rows of table must be distinct, or the nearest row below is not the
+    only row and the answer means nothing. That is asserted here rather than
+    at each call, so that no caller can leave it out.
     """
+    assert np.unique(table.round(10), axis=0).shape[0] == table.shape[0]
     distance = np.linalg.norm(points[:, None, :] - table[None, :, :], axis=2)
     rows = distance.argmin(axis=1)
     assert distance[np.arange(points.shape[0]), rows].max() < tol
@@ -787,7 +804,7 @@ def _vtk_wedge_reference_points(degree):
 
 def test_prism_vtk_output_writes_a_file(tmp_path):
     """VTKFile accepts a prism mesh and writes both files."""
-    mesh = Mesh(str(MESHDIR / AFFINE_MESHNAME))
+    mesh = Mesh(str(MESHDIR / EXACTNESS_MESHNAME))
     V = FunctionSpace(mesh, "CG", 1)
     f = Function(V, name="f")
     pvd, vtu = _write_pvd(tmp_path, f)
@@ -797,13 +814,13 @@ def test_prism_vtk_output_writes_a_file(tmp_path):
 
 def test_prism_vtk_output_writes_wedge_cells(tmp_path):
     """Every cell is a VTK_WEDGE of 6 nodes."""
-    mesh = Mesh(str(MESHDIR / AFFINE_MESHNAME))
+    mesh = Mesh(str(MESHDIR / EXACTNESS_MESHNAME))
     V = FunctionSpace(mesh, "CG", 1)
     f = Function(V, name="f")
     _, vtu = _write_pvd(tmp_path, f)
     points, cells, types, _ = _read_vtu(vtu)
 
-    _, gmsh_cells = _read_gmsh22_prisms(MESHDIR / AFFINE_MESHNAME)
+    _, gmsh_cells = _read_gmsh22_prisms(MESHDIR / EXACTNESS_MESHNAME)
     assert types.size == gmsh_cells.shape[0]
     assert np.all(types == VTK_WEDGE)
     assert cells.shape == (gmsh_cells.shape[0], 6)
@@ -819,15 +836,13 @@ def test_prism_vtk_output_node_order_matches_the_mesh(tmp_path):
     opens without an error and renders tangled cells, so nothing below may rely
     on the writer.
     """
-    mesh = Mesh(str(MESHDIR / AFFINE_MESHNAME))
+    mesh = Mesh(str(MESHDIR / EXACTNESS_MESHNAME))
     V = FunctionSpace(mesh, "CG", 1)
     f = Function(V, name="f")
     _, vtu = _write_pvd(tmp_path, f)
     points, cells, types, _ = _read_vtu(vtu)
 
-    coords, gmsh_cells = _read_gmsh22_prisms(MESHDIR / AFFINE_MESHNAME)
-    # _match_rows needs the gmsh nodes to be distinct.
-    assert np.unique(coords.round(10), axis=0).shape[0] == coords.shape[0]
+    coords, gmsh_cells = _read_gmsh22_prisms(MESHDIR / EXACTNESS_MESHNAME)
     by_vertices = {frozenset(int(v) for v in cell): [int(v) for v in cell]
                    for cell in gmsh_cells}
     assert len(by_vertices) == gmsh_cells.shape[0]
@@ -850,16 +865,70 @@ def test_prism_vtk_output_node_order_matches_the_mesh(tmp_path):
             assert far[near.index(first[k])] == second[k]
 
 
+@pytest.mark.parametrize("meshname", MESHNAMES)
+def test_prism_vtk_output_preserves_the_cell_handedness(tmp_path, meshname):
+    """The written order must not mirror the cell.
+
+    The test above does not pin the handedness, and on its own it is not
+    enough. The permutation [0, 4, 2, 1, 5, 3] reverses the winding of both
+    triangles while it keeps each triple a whole face and each axis pair
+    together, so it passes every other test in this file. It writes a mirrored
+    cell, which renders inside out and gives a negative volume.
+
+    The check compares two reference frames that are defined independently of
+    each other. The FIAT reference prism sends its x, y and z axes to the
+    vertices 2, 4 and 1. VTK's reference wedge sends its r, s and t axes to the
+    nodes 1, 2 and 3, which the corner list in _vtk_wedge_reference_points
+    states. Both frames map onto the same physical cell, so the determinants of
+    the two maps must carry the same sign. A mirrored order flips one and not
+    the other.
+
+    This holds on a warped cell too. The determinants are taken at the corner
+    the two frames share, so the check is about orientation, not about whether
+    the map is affine.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    V = FunctionSpace(mesh, "CG", 1)
+    f = Function(V, name="f")
+    _, vtu = _write_pvd(tmp_path, f)
+    points, cells, types, _ = _read_vtu(vtu)
+
+    vertex_map = mesh.coordinates.function_space().cell_node_map().values
+    coordinates = mesh.coordinates.dat.data_ro_with_halos
+    assert vertex_map.shape == (cells.shape[0], 6)
+
+    def sorted_rows(array):
+        return np.array(sorted(tuple(row) for row in array))
+
+    for cell in range(cells.shape[0]):
+        fiat = coordinates[vertex_map[cell]]
+        written = points[cells[cell]]
+        # Guard the assumption that row `cell` of the connectivity belongs to
+        # cell `cell` of the mesh. If that ever stops holding, fail here rather
+        # than compare two different cells below.
+        assert np.allclose(sorted_rows(fiat), sorted_rows(written),
+                           rtol=0, atol=1e-10)
+        det_fiat = np.linalg.det(np.stack([fiat[2] - fiat[0],
+                                           fiat[4] - fiat[0],
+                                           fiat[1] - fiat[0]]))
+        det_vtk = np.linalg.det(np.stack([written[1] - written[0],
+                                          written[2] - written[0],
+                                          written[3] - written[0]]))
+        # A flat cell would make the sign meaningless.
+        assert abs(det_fiat) > 1e-12
+        assert np.sign(det_vtk) == np.sign(det_fiat)
+
+
 @pytest.mark.parametrize("degree", [2, 3])
 def test_prism_vtk_output_writes_lagrange_wedge_cells(tmp_path, degree):
     """Above degree 1 the cell type is VTK_LAGRANGE_WEDGE."""
-    mesh = Mesh(str(MESHDIR / AFFINE_MESHNAME))
+    mesh = Mesh(str(MESHDIR / EXACTNESS_MESHNAME))
     V = FunctionSpace(mesh, "CG", degree)
     f = Function(V, name="f")
     _, vtu = _write_pvd(tmp_path, f)
     points, cells, types, _ = _read_vtu(vtu)
 
-    _, gmsh_cells = _read_gmsh22_prisms(MESHDIR / AFFINE_MESHNAME)
+    _, gmsh_cells = _read_gmsh22_prisms(MESHDIR / EXACTNESS_MESHNAME)
     assert types.size == gmsh_cells.shape[0]
     assert np.all(types == VTK_LAGRANGE_WEDGE)
     # A prism of degree k holds (k + 1)(k + 2)/2 nodes on the triangle and
@@ -872,8 +941,11 @@ def test_prism_vtk_output_points_sit_where_vtk_expects(tmp_path, degree):
     """Every written node sits at the place its VTK local index names.
 
     This extends the degree 1 node order test to the whole higher order
-    layout. The mesh is affine, so the degree 1 prism map through the 6 corners
-    gives the physical place of every node exactly.
+    layout. The degree 1 prism map through the 6 corners gives the physical
+    place of every node exactly, because the coordinate field of a gmsh prism
+    mesh has degree 1 and the output space has degree k >= 1, which contains
+    it. That is a statement about degree, not about whether the cell is
+    affine.
 
     Degree 1 is absent on purpose. The check below builds the map FROM the 6
     written corners, so at degree 1, where the corners are the whole cell, it
@@ -883,7 +955,7 @@ def test_prism_vtk_output_points_sit_where_vtk_expects(tmp_path, degree):
     test_prism_vtk_output_node_order_matches_the_mesh, which checks against the
     gmsh file rather than against the written corners.
     """
-    mesh = Mesh(str(MESHDIR / AFFINE_MESHNAME))
+    mesh = Mesh(str(MESHDIR / EXACTNESS_MESHNAME))
     V = FunctionSpace(mesh, "CG", degree)
     f = Function(V, name="f")
     _, vtu = _write_pvd(tmp_path, f)
@@ -904,7 +976,7 @@ def test_prism_vtk_output_point_data_matches_the_written_points(tmp_path, degree
     A linear function is in the space at every degree here, so the written
     values must match it to round off.
     """
-    mesh = Mesh(str(MESHDIR / AFFINE_MESHNAME))
+    mesh = Mesh(str(MESHDIR / EXACTNESS_MESHNAME))
     V = FunctionSpace(mesh, "CG", degree)
     x, y, z = SpatialCoordinate(mesh)
     f = Function(V, name="linear").interpolate(2.0 * x - 3.0 * y + 5.0 * z + 1.0)
@@ -920,8 +992,9 @@ def test_prism_vtk_output_point_data_matches_the_written_points(tmp_path, degree
 def test_prism_vtk_output_round_trips_the_geometry(tmp_path, meshname):
     """Every prism mesh writes, and the written cells hold the mesh vertices.
 
-    The warped mesh is not affine, so this checks the vertices only. It makes
-    no claim about where a higher order node sits on a warped cell.
+    This runs on all four meshes and checks the vertex sets only, so it is the
+    broad guard that every mesh writes and survives the round trip. The node
+    order is pinned by the two tests above.
     """
     mesh = Mesh(str(MESHDIR / meshname))
     V = FunctionSpace(mesh, "CG", 1)
@@ -941,7 +1014,7 @@ def test_prism_vtk_output_round_trips_the_geometry(tmp_path, meshname):
 def test_prism_vtk_output_takes_a_discontinuous_function(tmp_path):
     """A discontinuous function reaches get_sup_element, which must not ask
     for a "DQ" element on a prism."""
-    mesh = Mesh(str(MESHDIR / AFFINE_MESHNAME))
+    mesh = Mesh(str(MESHDIR / EXACTNESS_MESHNAME))
     V = FunctionSpace(mesh, "DG", 1)
     f = Function(V, name="f")
     _, vtu = _write_pvd(tmp_path, f)
@@ -974,35 +1047,31 @@ def test_prism_sup_element_is_discontinuous_lagrange():
 # must not move. get_sup_element picks the family of every cell type, and
 # vtk_lagrange_wedge_reorder permutes the nodes of both wedge flavours.
 #
-# The value below was MEASURED on the branch before the change, and it is not
-# the value the source reads like. get_sup_element asks for the short name
-# "DQ", but finat.ufl rewrites a FiniteElement on a ufl.TensorProductCell into
-# a TensorProductElement with one factor per axis, and reports the factor
-# family. So the family that comes back is "Discontinuous Lagrange".
-EXTRUDED_WEDGE_SUP_FAMILY = "Discontinuous Lagrange"
+def test_extruded_wedge_sup_element_takes_neither_new_branch():
+    """get_sup_element must not send the extruded wedge down the prism branch.
 
+    This asserts the branch condition, not the element it returns, and the
+    reason is worth stating. No element level guard can do this job. For any
+    ufl.TensorProductCell, canonical_element_description rewrites the family
+    "Discontinuous Lagrange" to "DQ", so "DG" and "DQ" build the SAME element
+    on a wedge. A get_sup_element that wrongly sent the wedge to "DG" would
+    return an element equal to the right one, and a guard that compared
+    elements or families would pass. The only observable difference is a
+    warnings.warn at order >= 1, and pinning a warning string owned by FInAT
+    would test a diagnostic rather than a behaviour.
 
-def test_extruded_wedge_sup_element_is_unchanged():
-    """get_sup_element must leave the extruded wedge where it was.
-
-    Adding "prism" to the "DG" set touches a function that every cell type
-    flows through. The extruded wedge does not move, because its cell is a
-    ufl.TensorProductCell, for which canonical_element_description sets the
-    cellname to None and skips the family check. This pins that, so the claim
-    is a measurement and not an argument.
+    So the real invariant is the one below: the cellname of a wedge is
+    "triangle * interval", which cannot equal "prism" or any other name in the
+    set. The change to get_sup_element is therefore unreachable from a wedge.
+    The measurement that the extruded wedge output does not move is the
+    byte-identical comparison of its .vtu files, not this test.
     """
-    import finat.ufl
     import ufl
-    from firedrake.output.vtk_output import get_sup_element
 
     wedge = ufl.TensorProductCell(ufl.Cell("triangle"), ufl.Cell("interval"))
-    element = finat.ufl.TensorProductElement(
-        finat.ufl.FiniteElement("CG", ufl.triangle, 2),
-        finat.ufl.FiniteElement("CG", ufl.interval, 2),
-        cell=wedge)
-    sup = get_sup_element(element, continuous=False)
-    assert sup.family() == EXTRUDED_WEDGE_SUP_FAMILY
-    assert sup.cell == wedge
+    assert wedge.cellname == "triangle * interval"
+    assert wedge.cellname not in {"interval", "triangle", "tetrahedron",
+                                  "prism"}
 
 
 @pytest.mark.parametrize("degree", [1, 2, 3])
@@ -1016,9 +1085,11 @@ def test_extruded_wedge_output_is_unchanged(tmp_path, degree):
 
     A linear function alone is a weak probe of a permutation, because many
     wrong permutations leave it unchanged. The node place check below is the
-    one that answers the permutation question. A cell of a flat extrusion is
-    affine, so the degree 1 map through the 6 corners is exact, exactly as it
-    is on prism_slab.msh.
+    one that answers the permutation question. The degree 1 map through the 6
+    corners is exact for the same reason it is exact on a prism mesh: the
+    coordinate field has degree 1 and the output space has degree k >= 1, so
+    the output space contains it. The rule is about degree, not about whether
+    the cell is affine.
     """
     import ufl
 
