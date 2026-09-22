@@ -1091,3 +1091,333 @@ def test_extruded_wedge_reorder_permutation_is_unchanged(degree):
     assert vtk_lagrange_wedge_reorder(element) == invert(
         vtk_wedge_local_to_cart(element.degree()),
         firedrake_local_to_cart(element))
+
+
+# ------------------------------------ the PETSc DG1 transitive closure layout
+#
+# PETSc represents the coordinates of a periodic mesh with a DG1 element whose
+# dofs follow the order of the vertices in the transitive closure of the cell.
+# _get_firedrake_plex_permutation_dg_transitive_closure in
+# firedrake/cython/dmcommon.pyx holds one permutation per cell type, and
+# transform_vec_from_firedrake_to_petsc reads it as
+#
+#   petsc[petsc_offset + perm[i]] = firedrake[firedrake_offset + i]
+#
+# so perm[i] is the slot that the dof of FIAT vertex i takes.
+#
+# The 6 vertices of a TRI_PRISM fill the closure positions 15 to 20.
+# _reorder_plex_closure sends the FIAT vertices 0 to 5 to the closure positions
+# 15, 18, 16, 20, 17, 19, so the slot of FIAT vertex i is that position less the
+# base 15.
+#
+#   FIAT vertex       0   1   2   3   4   5
+#   closure position 15  18  16  20  17  19
+#   PETSc DG1 slot    0   3   1   5   2   4
+#
+# The same subtraction on the hexahedron, whose vertices fill the closure
+# positions 19 to 26 and whose FIAT vertices 0 to 7 go to 19, 23, 20, 26, 22,
+# 24, 21, 25, gives (0, 4, 1, 7, 3, 5, 2, 6), which is the entry that the table
+# already held. The tests below repeat neither arithmetic: they read both orders
+# from the plex.
+PRISM_DG_PERM = (0, 3, 1, 5, 2, 4)
+HEXAHEDRON_DG_PERM = (0, 4, 1, 7, 3, 5, 2, 6)
+
+
+def _dg_closure_vertex_perm(mesh):
+    """Derive the PETSc DG1 vertex permutation from the plex of a mesh.
+
+    :arg mesh: A mesh whose cell closure comes from _reorder_plex_closure,
+        which is a hexahedral mesh or a prism mesh.
+    :returns: The set of the permutations of the cells of this process.
+
+    perm[i] is the place of FIAT vertex i in the list of the vertices of the
+    transitive closure of the cell. This reads the FIAT order from
+    ``cell_closure`` and the closure order from the plex, so it repeats no
+    constant of dmcommon.pyx. The rule of _reorder_plex_closure is fixed, so
+    every cell must give the same permutation and the set holds one entry.
+    """
+    dm = mesh.topology_dm
+    cell_numbering = mesh.topology._cell_numbering
+    cell_closure = mesh.topology.cell_closure
+    vStart, vEnd = dm.getDepthStratum(0)
+    cStart, cEnd = dm.getHeightStratum(0)
+    perms = set()
+    for plex_cell in range(cStart, cEnd):
+        closure, _ = dm.getTransitiveClosure(plex_cell)
+        closure_vertices = [p for p in closure if vStart <= p < vEnd]
+        cell = cell_numbering.getOffset(plex_cell)
+        fiat_vertices = cell_closure[cell][:len(closure_vertices)]
+        perms.add(tuple(closure_vertices.index(v) for v in fiat_vertices))
+    return perms
+
+
+@pytest.mark.parametrize("meshname", MESHNAMES)
+def test_prism_dg_permutation_table(meshname):
+    from firedrake.cython import dmcommon
+
+    mesh = Mesh(str(MESHDIR / meshname))
+    ndofs, perm, perm_offsets = \
+        dmcommon._get_firedrake_plex_permutation_dg_transitive_closure(
+            mesh.topology_dm)
+    assert list(ndofs) == [6, 0, 0, 0]
+    assert list(perm_offsets) == [0, 6, 6, 6, 6]
+    assert tuple(perm) == PRISM_DG_PERM
+    # The table must agree with the plex, which is the independent derivation.
+    assert _dg_closure_vertex_perm(mesh) == {PRISM_DG_PERM}
+
+
+def test_prism_dg_permutation_is_not_the_identity():
+    """The negative control of the table test above.
+
+    A round trip that writes with perm and reads with perm gives the input back
+    for every perm, so a test of that kind passes with the identity in the
+    table. The entry is not the identity, so the tests must read the layout
+    itself, which test_prism_plex_dg_coordinates_are_in_closure_order does.
+    """
+    from firedrake.cython import dmcommon
+
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    _, perm, _ = dmcommon._get_firedrake_plex_permutation_dg_transitive_closure(
+        mesh.topology_dm)
+    assert sorted(perm) == list(range(6))
+    assert tuple(perm) != tuple(range(6))
+
+
+def test_hexahedron_dg_permutation_table_is_unchanged():
+    """The control of the prism table test.
+
+    _dg_closure_vertex_perm must reproduce the hexahedron entry, which was
+    correct before this task. If it does, it derives the prism entry correctly
+    too, because both cell types take the same fixed closure rule.
+    """
+    from firedrake.cython import dmcommon
+
+    mesh = UnitCubeMesh(1, 1, 1, hexahedral=True)
+    ndofs, perm, perm_offsets = \
+        dmcommon._get_firedrake_plex_permutation_dg_transitive_closure(
+            mesh.topology_dm)
+    assert list(ndofs) == [8, 0, 0, 0]
+    assert list(perm_offsets) == [0, 8, 8, 8, 8]
+    assert tuple(perm) == HEXAHEDRON_DG_PERM
+    assert _dg_closure_vertex_perm(mesh) == {HEXAHEDRON_DG_PERM}
+
+
+def _localise_plex_coordinates(mesh):
+    """Give the plex of a mesh the PETSc DG coordinates, in place.
+
+    This is the body of _postprocess_periodic_mesh in
+    firedrake/utility_meshes.py, which is the one caller of
+    _set_dg_coordinates. _set_dg_coordinates is the writer that reads the
+    permutation table.
+    """
+    from firedrake import FiniteElement, VectorFunctionSpace
+    from firedrake.cython import dmcommon
+
+    # The variant must be equispaced, as it is in _postprocess_periodic_mesh.
+    # The permutation gives a slot to each FIAT VERTEX, so the nodes of the
+    # element must sit at the vertices. The default variant puts them at the
+    # Gauss points instead.
+    element = FiniteElement("DG", mesh.ufl_cell(), 1, variant="equispaced")
+    V = VectorFunctionSpace(mesh, element)
+    coords = Function(V).interpolate(SpatialCoordinate(mesh))
+    dmcommon._set_dg_coordinates(mesh.topology_dm, V.finat_element,
+                                 V.dm.getLocalSection(), coords.dat._vec)
+
+
+def _assert_plex_dg_coordinates_are_in_closure_order(mesh):
+    """Check the PETSc DG coordinate layout of a mesh against its plex.
+
+    PETSc orders the dofs of its DG1 coordinate element by the order of the
+    vertices in the transitive closure of the cell, so slot k of a cell must
+    hold the coordinates of closure vertex k. The expected values come from the
+    CG coordinate section of the plex, which the permutation never touches, so
+    this is an independent check of the layout.
+
+    A round trip through _set_dg_coordinates and back is NOT such a check: both
+    directions read the same table, so they agree for every permutation. This
+    test fails when the table is wrong, because a wrong slot then holds the
+    coordinates of a different vertex.
+    """
+    dm = mesh.topology_dm
+    gdim = dm.getCoordinateDim()
+    cg_section = dm.getCoordinateSection()
+    cg_coords = dm.getCoordinatesLocal().array_r.reshape(-1, gdim).copy()
+    vStart, vEnd = dm.getDepthStratum(0)
+    cStart, cEnd = dm.getHeightStratum(0)
+    closure_vertices = {}
+    for plex_cell in range(cStart, cEnd):
+        closure, _ = dm.getTransitiveClosure(plex_cell)
+        closure_vertices[plex_cell] = [p for p in closure
+                                       if vStart <= p < vEnd]
+    _localise_plex_coordinates(mesh)
+    cell_section = dm.getCellCoordinateSection()
+    cell_coords = dm.getCellCoordinatesLocal().array_r.reshape(-1, gdim)
+    assert cStart < cEnd
+    for plex_cell, vertices in closure_vertices.items():
+        offset = cell_section.getOffset(plex_cell) // gdim
+        for k, vertex in enumerate(vertices):
+            expected = cg_coords[cg_section.getOffset(vertex) // gdim]
+            assert np.allclose(cell_coords[offset + k], expected,
+                               rtol=0, atol=1e-13)
+
+
+@pytest.mark.parametrize("meshname", MESHNAMES)
+def test_prism_plex_dg_coordinates_are_in_closure_order(meshname):
+    _assert_plex_dg_coordinates_are_in_closure_order(
+        Mesh(str(MESHDIR / meshname)))
+
+
+def test_hexahedron_plex_dg_coordinates_are_in_closure_order():
+    """The control of the prism layout test.
+
+    The hexahedron entry was correct before this task, so this pins that the
+    check itself passes on a cell type whose answer is known.
+    """
+    _assert_plex_dg_coordinates_are_in_closure_order(
+        UnitCubeMesh(1, 1, 1, hexahedral=True))
+
+
+# --------------------------------------------------------------- checkpoint io
+#
+# A checkpoint stores the cones of the plex and not the cell types, so PETSc
+# infers the type of every cell on load. A cell of 2 triangles and 3
+# quadrilaterals is either a DM_POLYTOPE_TRI_PRISM or a
+# DM_POLYTOPE_TRI_PRISM_TENSOR, and the PETSc default picks the tensor type,
+# which Firedrake does not support. firedrake/checkpointing.py calls
+# dmcommon.relabel_tensor_prisms after topologyLoad to correct that.
+
+CHECKPOINT_MESH_NAME = "prism_checkpoint_mesh"
+
+
+def _checkpoint_expr(mesh, vector):
+    """An expression whose value differs at every node of a prism mesh.
+
+    A field that a permutation of the vertices leaves alone proves nothing, so
+    the coefficients are incommensurable and none of the meshes has a symmetry
+    that maps one node onto another with the same value.
+    """
+    from firedrake import as_vector
+
+    x, y, z = SpatialCoordinate(mesh)
+    base = 1.0 + np.pi * x + np.e * y + np.sqrt(2.0) * z + 0.25 * x * y
+    if not vector:
+        return base
+    return as_vector([base, 2.0 * base + x * z, 3.0 - base + y * z])
+
+
+def _assert_checkpoint_round_trip(tmp_path, meshname, degree, vector=False):
+    """Save a mesh and a function, load them back, and compare."""
+    from firedrake import VectorFunctionSpace
+    from firedrake.checkpointing import CheckpointFile
+    from pyop2.mpi import COMM_WORLD
+
+    filename = COMM_WORLD.bcast(str(Path(tmp_path) / "prism_checkpoint.h5"),
+                                root=0)
+    mesh = Mesh(str(MESHDIR / meshname), name=CHECKPOINT_MESH_NAME)
+    make_space = VectorFunctionSpace if vector else FunctionSpace
+    V = make_space(mesh, "CG", degree)
+    f = Function(V, name="f").interpolate(_checkpoint_expr(mesh, vector))
+    if COMM_WORLD.size == 1:
+        rows = f.dat.data_ro.reshape(f.dat.data_ro.shape[0], -1)
+        assert len(np.unique(rows, axis=0)) == rows.shape[0], \
+            "the field must differ at every node, or a wrong slot stays hidden"
+    with CheckpointFile(filename, "w", comm=COMM_WORLD) as chk:
+        chk.save_mesh(mesh)
+        chk.save_function(f)
+    with CheckpointFile(filename, "r", comm=COMM_WORLD) as chk:
+        loaded_mesh = chk.load_mesh(CHECKPOINT_MESH_NAME)
+        g = chk.load_function(loaded_mesh, "f")
+    assert loaded_mesh.ufl_cell().cellname == "prism"
+    assert loaded_mesh.topology.dm_cell_types == \
+        (PETSc.DM.PolytopeType.TRI_PRISM,)
+    expected = Function(g.function_space()).interpolate(
+        _checkpoint_expr(loaded_mesh, vector))
+    # The loaded coordinates equal the saved ones to the last bit, so the two
+    # fields agree to the last bit and the squared difference is zero.
+    assert assemble(inner(g - expected, g - expected) * dx) < 1e-18
+    if COMM_WORLD.size == 1:
+        # A load on one process keeps the distribution and the numbering, so
+        # the dofs must agree one by one.
+        assert np.allclose(g.dat.data_ro, f.dat.data_ro, rtol=0, atol=1e-14)
+
+
+@pytest.mark.parametrize("meshname", MESHNAMES)
+def test_prism_checkpoint_round_trips_a_cg1_function(tmp_path, meshname):
+    _assert_checkpoint_round_trip(tmp_path, meshname, 1)
+
+
+@pytest.mark.parametrize("degree", [2, 3])
+def test_prism_checkpoint_round_trips_a_higher_degree_function(tmp_path,
+                                                               degree):
+    _assert_checkpoint_round_trip(tmp_path, "prism_slab.msh", degree)
+
+
+@pytest.mark.parametrize("degree", [1, 2])
+def test_prism_checkpoint_round_trips_a_vector_function(tmp_path, degree):
+    _assert_checkpoint_round_trip(tmp_path, "prism_slab.msh", degree,
+                                  vector=True)
+
+
+def test_prism_checkpoint_round_trips_the_warped_mesh(tmp_path):
+    """prism_warped.msh has non-affine cells whose axes tilt differently."""
+    _assert_checkpoint_round_trip(tmp_path, "prism_warped.msh", 1)
+
+
+@pytest.mark.parallel(nprocs=[2, 3])
+def test_prism_checkpoint_round_trips_in_parallel(tmp_path):
+    _assert_checkpoint_round_trip(tmp_path, "prism_slab.msh", 1)
+
+
+@pytest.mark.parallel(nprocs=[2, 3])
+def test_prism_checkpoint_round_trips_cg2_in_parallel(tmp_path):
+    _assert_checkpoint_round_trip(tmp_path, "prism_slab.msh", 2)
+
+
+def test_relabel_tensor_prisms_leaves_a_prism_mesh_alone(meshname):
+    from firedrake.cython import dmcommon
+
+    mesh = Mesh(str(MESHDIR / meshname))
+    dm = mesh.topology_dm
+    dmcommon.relabel_tensor_prisms(dm)
+    cStart, cEnd = dm.getHeightStratum(0)
+    for c in range(cStart, cEnd):
+        assert dm.getCellType(c) == PETSc.DM.PolytopeType.TRI_PRISM
+
+
+def test_relabel_tensor_prisms_leaves_a_hexahedral_mesh_alone():
+    from firedrake.cython import dmcommon
+
+    mesh = UnitCubeMesh(1, 1, 1, hexahedral=True)
+    dm = mesh.topology_dm
+    dmcommon.relabel_tensor_prisms(dm)
+    cStart, cEnd = dm.getHeightStratum(0)
+    for c in range(cStart, cEnd):
+        assert dm.getCellType(c) == PETSc.DM.PolytopeType.HEXAHEDRON
+
+
+def test_prism_checkpoint_load_agrees_with_the_cell_type_label(tmp_path):
+    """The cell type cache and the cell type label of a loaded plex must agree.
+
+    labelsLoad calls DMRemoveLabel on the cell type label, which leaves the
+    cell type cache of the plex behind. A relabel that runs after labelsLoad
+    therefore corrects the label alone and leaves the cache holding the tensor
+    type. getCellType reads the cache and getCellTypeLabel reads the label, so
+    comparing the two catches that.
+    """
+    from firedrake.checkpointing import CheckpointFile
+    from pyop2.mpi import COMM_WORLD
+
+    filename = COMM_WORLD.bcast(str(Path(tmp_path) / "prism_celltype.h5"),
+                                root=0)
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"), name=CHECKPOINT_MESH_NAME)
+    with CheckpointFile(filename, "w", comm=COMM_WORLD) as chk:
+        chk.save_mesh(mesh)
+    with CheckpointFile(filename, "r", comm=COMM_WORLD) as chk:
+        loaded_mesh = chk.load_mesh(CHECKPOINT_MESH_NAME)
+    dm = loaded_mesh.topology_dm
+    label = dm.getCellTypeLabel()
+    cStart, cEnd = dm.getHeightStratum(0)
+    assert cEnd > cStart
+    for c in range(cStart, cEnd):
+        assert dm.getCellType(c) == PETSc.DM.PolytopeType.TRI_PRISM
+        assert label.getValue(c) == int(PETSc.DM.PolytopeType.TRI_PRISM)

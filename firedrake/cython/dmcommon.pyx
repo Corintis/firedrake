@@ -1998,6 +1998,18 @@ def _get_firedrake_plex_permutation_dg_transitive_closure(PETSc.DM dm):
     elif dm_cell_type == PETSc.DM.PolytopeType.HEXAHEDRON:
         ndofs = np.array([8, 0, 0, 0], dtype=IntType)
         perm = np.array([0, 4, 1, 7, 3, 5, 2, 6], dtype=IntType)
+    elif dm_cell_type == PETSc.DM.PolytopeType.TRI_PRISM:
+        # The 6 vertices of a TRI_PRISM occupy transitive closure positions
+        # 15 to 20. _reorder_plex_closure sends FIAT vertices 0 to 5 to the
+        # closure positions 15, 18, 16, 20, 17, 19. The PETSc DG1 layout
+        # numbers a vertex dof by the order of the vertex in the closure, so
+        # the slot of FIAT vertex i is its closure position less the base 15:
+        #
+        #   FIAT vertex       0   1   2   3   4   5
+        #   closure position 15  18  16  20  17  19
+        #   PETSc DG1 slot    0   3   1   5   2   4
+        ndofs = np.array([6, 0, 0, 0], dtype=IntType)
+        perm = np.array([0, 3, 1, 5, 2, 4], dtype=IntType)
     else:
         raise NotImplementedError(f"Not implemented for dm_cell_type ({dm_cell_type})")
     perm_offsets = np.add.accumulate(np.concatenate((np.array([0], dtype=IntType), ndofs)), dtype=IntType)
@@ -4561,3 +4573,67 @@ def get_dm_cell_types(PETSc.DM dm):
     return tuple(
         polytope_type_enum for polytope_type_enum, found in enumerate(found_all) if found
     )
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def relabel_tensor_prisms(PETSc.DM dm):
+    """Relabel every DM_POLYTOPE_TRI_PRISM_TENSOR cell as DM_POLYTOPE_TRI_PRISM.
+
+    Parameters
+    ----------
+    dm : PETSc.DM
+        The dm to relabel. It is changed in place.
+
+    A DMPlex that is built from cones alone, as ``DMPlexTopologyLoad`` builds
+    one, holds no cell type. PETSc infers the type of each cell from its cone
+    size, and a cell of 2 triangles and 3 quadrilaterals is either a
+    DM_POLYTOPE_TRI_PRISM or a DM_POLYTOPE_TRI_PRISM_TENSOR. PETSc breaks the
+    tie with the flag of ``DMPlexSetInterpolatePreferTensor``, whose default
+    gives the tensor type. petsc4py exposes no setter for that flag, so this
+    function corrects the cell types after the fact.
+
+    This corrects the inference of PETSc. It does not defeat the guard of
+    ``_ufl_cell`` in ``firedrake/mesh.py``, which rejects
+    DM_POLYTOPE_TRI_PRISM_TENSOR because the cone of that type orders the faces
+    differently and the closure permutation does not apply to it. Firedrake
+    supports DM_POLYTOPE_TRI_PRISM only, so it can write no checkpoint that
+    holds a cell of the tensor type, and a checkpoint carries the cones
+    unchanged. The cone order of a loaded cell is therefore always the
+    DM_POLYTOPE_TRI_PRISM one, and the tensor type that PETSc infers is a wrong
+    answer to a question that the cones alone cannot settle. Call this on a dm
+    that a checkpoint supplies, not on a dm of unknown origin.
+
+    Caution. Call this BEFORE ``DMPlexLabelsLoad``, not after. A checkpoint
+    holds the cell type label, and the load of it calls ``DMRemoveLabel``, which
+    clears the label but leaves the cell type cache of the dm, the
+    ``cellTypes`` array that ``DMPlexGetCellType`` reads first. So a load leaves
+    a correct label and a cache that still holds the inferred tensor type. A
+    PETSc build with debugging then raises PETSC_ERR_PLIB on the first
+    ``DMPlexGetCellType``, and a build without debugging returns the tensor type
+    in silence. ``DMPlexSetCellType`` writes both the label and the cache, so
+    this function keeps the two in step when it runs first.
+
+    This function is collective, because it reads the cell type label.
+
+    """
+    cdef:
+        DMLabel celltype_label = NULL
+        PetscInt tensor_type, nprisms, i, c
+        np.ndarray cells
+
+    tensor_type = <PetscInt>DM_POLYTOPE_TRI_PRISM_TENSOR
+    # Collective: it computes the cell types when the dm holds none.
+    py_celltype_label = dm.getCellTypeLabel()
+    CHKERR(DMGetLabel(dm.dm, "celltype".encode(), &celltype_label))
+    CHKERR(DMLabelGetStratumSize(celltype_label, tensor_type, &nprisms))
+    if nprisms == 0:
+        return
+    # getStratumIS gives an array of its own, so the clear cannot invalidate it.
+    cells = py_celltype_label.getStratumIS(tensor_type).indices
+    CHKERR(DMLabelClearStratum(celltype_label, tensor_type))
+    # DMPlexSetCellType sets the label and the cell type cache of the dm, so it
+    # must run after the clear, which empties the label alone.
+    for i in range(nprisms):
+        c = cells[i]
+        CHKERR(DMPlexSetCellType(dm.dm, c, DM_POLYTOPE_TRI_PRISM))
