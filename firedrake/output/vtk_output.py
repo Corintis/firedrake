@@ -49,6 +49,10 @@ cells = {
     (ufl.Cell("tetrahedron"), True): VTK_LAGRANGE_TETRAHEDRON,
     (ufl_wedge, False): VTK_WEDGE,
     (ufl_wedge, True): VTK_LAGRANGE_WEDGE,
+    # An unstructured prism cell is the same shape as an extruded wedge, so it
+    # takes the same two VTK cell types.
+    (ufl.Cell("prism"), False): VTK_WEDGE,
+    (ufl.Cell("prism"), True): VTK_LAGRANGE_WEDGE,
     (ufl_hex, False): VTK_HEXAHEDRON,
     (ufl_hex, True): VTK_LAGRANGE_HEXAHEDRON,
     (ufl.Cell("hexahedron"), False): VTK_HEXAHEDRON,
@@ -106,7 +110,13 @@ def get_sup_element(*elements, continuous=False, max_degree=None):
     if continuous:
         family = "CG"
     else:
-        if cell.cellname in {"interval", "triangle", "tetrahedron"}:
+        # A prism takes "DG", not "DQ". "DQ" is registered on the hypercubes
+        # only, so finat.ufl.FiniteElement("DQ", prism, k) raises a ValueError.
+        # "DG" on a prism builds P_k(triangle) x P_k(interval), which is the
+        # discontinuous prism space. The extruded wedge keeps "DQ" because its
+        # cell is a ufl.TensorProductCell, whose cellname the family check
+        # skips.
+        if cell.cellname in {"interval", "triangle", "tetrahedron", "prism"}:
             family = "DG"
         else:
             family = "DQ"
@@ -156,6 +166,18 @@ def get_topology(coordinates):
         # | /\ |     | /\ |
         # |/  \|     |/  \|
         # 0----2     0----1
+        #
+        # The same permutation serves the extruded wedge and the unstructured
+        # prism, because the two elements number their 6 vertices alike. The
+        # reference vertices are
+        #
+        #   0 = (0, 0, 0)   1 = (0, 0, 1)
+        #   2 = (1, 0, 0)   3 = (1, 0, 1)
+        #   4 = (0, 1, 0)   5 = (0, 1, 1)
+        #
+        # so the pairs (0, 1), (2, 3) and (4, 5) are the three axis edges.
+        # VTK_WEDGE wants the two triangular faces as contiguous triples, the
+        # face at z = 0 first: [0, 2, 4, 1, 3, 5].
         values = values[:, [0, 2, 4, 1, 3, 5]]
     elif cells[cell, nonLinear] == VTK_HEXAHEDRON:
         # Hexahedron is

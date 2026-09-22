@@ -213,8 +213,13 @@ def vtk_lagrange_tet_reorder(ufl_element):
 
 
 def vtk_lagrange_wedge_reorder(ufl_element):
-    degree = ufl_element.degree()
-    vtk_local = vtk_wedge_local_to_cart(degree)
+    # An extruded wedge carries one degree per factor, so its degree is the
+    # pair (triangle, interval). An unstructured prism carries a single degree
+    # for the whole cell, so repeat it to make the same pair.
+    degrees = as_tuple(ufl_element.degree())
+    if len(degrees) == 1:
+        degrees = degrees * 2
+    vtk_local = vtk_wedge_local_to_cart(degrees)
     firedrake_local = firedrake_local_to_cart(ufl_element)
     return invert(vtk_local, firedrake_local)
 

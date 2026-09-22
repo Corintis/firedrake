@@ -35,9 +35,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from firedrake import (Constant, DirichletBC, Function, FunctionSpace, Mesh,
-                       SpatialCoordinate, TestFunction, TrialFunction,
-                       UnitCubeMesh, assemble, dx, grad, inner, solve)
+from firedrake import (Constant, DirichletBC, ExtrudedMesh, Function,
+                       FunctionSpace, Mesh, SpatialCoordinate, TestFunction,
+                       TrialFunction, UnitCubeMesh, UnitSquareMesh, VTKFile,
+                       assemble, dx, grad, inner, solve)
 from firedrake.petsc import PETSc
 
 
@@ -680,3 +681,413 @@ def test_hexahedron_face_still_supplies_eight_orientations():
     orientations = mesh.topology.entity_orientations
     # A hexahedron closure is 8 vertices, 12 edges, 6 faces, then the cell.
     assert orientations[:, 20:26].max() < 8
+
+
+# ------------------------------------------------------------------ VTK output
+
+# The VTK cell types that a prism cell takes.
+VTK_WEDGE = 13
+VTK_LAGRANGE_WEDGE = 73
+
+# prism_slab.msh has an affine map on every cell, so the degree 1 prism map
+# reproduces the coordinates of a higher degree output exactly. The warped
+# mesh does not, so it carries no exactness claim here.
+AFFINE_MESHNAME = "prism_slab.msh"
+
+
+def _write_pvd(tmp_path, *functions, name="prism"):
+    """Write functions to tmp_path/name.pvd.
+
+    :returns: A pair (pvd, vtu) of paths. VTKFile puts the .vtu files in a
+        subdirectory that carries the name of the .pvd file.
+    """
+    pvd = tmp_path / f"{name}.pvd"
+    VTKFile(str(pvd)).write(*functions)
+    return pvd, tmp_path / name / f"{name}_0.vtu"
+
+
+def _read_vtu(path):
+    """Read a .vtu with VTK itself, so VTK is the reader under test.
+
+    :returns: A tuple (points, cells, types, point_data). points is an
+        (npoints, 3) array. cells is an (ncells, nodes_per_cell) array of
+        indices into points. types is an (ncells,) array of VTK cell types.
+        point_data maps each array name to an (npoints, ...) array.
+    """
+    from vtkmodules.util.numpy_support import vtk_to_numpy
+    from vtkmodules.vtkIOXML import vtkXMLUnstructuredGridReader
+
+    reader = vtkXMLUnstructuredGridReader()
+    reader.SetFileName(str(path))
+    reader.Update()
+    grid = reader.GetOutput()
+
+    points = vtk_to_numpy(grid.GetPoints().GetData())
+    types = vtk_to_numpy(grid.GetCellTypesArray())
+    connectivity = vtk_to_numpy(grid.GetCells().GetConnectivityArray())
+    offsets = vtk_to_numpy(grid.GetCells().GetOffsetsArray())
+    sizes = np.diff(offsets)
+    assert sizes.size == types.size
+    # Every cell of a prism mesh holds the same number of nodes, so the
+    # connectivity reshapes to one row per cell.
+    assert np.all(sizes == sizes[0])
+    cells = connectivity.reshape(types.size, int(sizes[0]))
+
+    arrays = grid.GetPointData()
+    point_data = {arrays.GetArrayName(i): vtk_to_numpy(arrays.GetArray(i))
+                  for i in range(arrays.GetNumberOfArrays())}
+    return points, cells, types, point_data
+
+
+def _match_rows(points, table, tol=1e-10):
+    """Find the row of table that each row of points sits on.
+
+    :arg points: An (n, 3) array.
+    :arg table: An (m, 3) array of distinct points.
+    :returns: An (n,) array of indices into table.
+    """
+    distance = np.linalg.norm(points[:, None, :] - table[None, :, :], axis=2)
+    rows = distance.argmin(axis=1)
+    assert distance[np.arange(points.shape[0]), rows].max() < tol
+    return rows
+
+
+def _prism_map(vertices, reference):
+    """Map reference prism points through the degree 1 prism map.
+
+    :arg vertices: A (6, 3) array of physical vertices in VTK wedge order,
+        that is the first triangular face, then the second.
+    :arg reference: An (n, 3) array of points of the reference prism.
+    :returns: An (n, 3) array of physical points.
+    """
+    x, y, z = reference[:, 0], reference[:, 1], reference[:, 2]
+    barycentric = np.stack([1.0 - x - y, x, y], axis=1)
+    first = barycentric @ vertices[:3]
+    second = barycentric @ vertices[3:]
+    return (1.0 - z)[:, None] * first + z[:, None] * second
+
+
+def _vtk_wedge_reference_points(degree):
+    """The reference prism points of VTK's wedge, in VTK's own order.
+
+    VTK is the only authority on the node layout of a VTK_LAGRANGE_WEDGE, so
+    this asks VTK through the wrapper that the output module uses. The degree 1
+    corners are asserted against a hand written list, which is independent.
+    """
+    from firedrake.output.paraview_reordering import vtk_wedge_local_to_cart
+
+    points = np.array([np.asarray(p)
+                       for p in vtk_wedge_local_to_cart((degree, degree))])
+    # VTK puts the 6 corners first, in VTK_WEDGE order.
+    corners = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+               [0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]]
+    assert np.allclose(points[:6], corners)
+    return points
+
+
+def test_prism_vtk_output_writes_a_file(tmp_path):
+    """VTKFile accepts a prism mesh and writes both files."""
+    mesh = Mesh(str(MESHDIR / AFFINE_MESHNAME))
+    V = FunctionSpace(mesh, "CG", 1)
+    f = Function(V, name="f")
+    pvd, vtu = _write_pvd(tmp_path, f)
+    assert pvd.is_file()
+    assert vtu.is_file()
+
+
+def test_prism_vtk_output_writes_wedge_cells(tmp_path):
+    """Every cell is a VTK_WEDGE of 6 nodes."""
+    mesh = Mesh(str(MESHDIR / AFFINE_MESHNAME))
+    V = FunctionSpace(mesh, "CG", 1)
+    f = Function(V, name="f")
+    _, vtu = _write_pvd(tmp_path, f)
+    points, cells, types, _ = _read_vtu(vtu)
+
+    _, gmsh_cells = _read_gmsh22_prisms(MESHDIR / AFFINE_MESHNAME)
+    assert types.size == gmsh_cells.shape[0]
+    assert np.all(types == VTK_WEDGE)
+    assert cells.shape == (gmsh_cells.shape[0], 6)
+
+
+def test_prism_vtk_output_node_order_matches_the_mesh(tmp_path):
+    """The written node order is the order that VTK_WEDGE asks for.
+
+    This is the test that catches a wrong node permutation. The gmsh file is
+    the independent authority: gmsh writes a 6 node prism as one triangular
+    face, then the opposite face, with node 4 across the axis from node 1. That
+    is also what VTK_WEDGE asks for. A file written with a wrong permutation
+    opens without an error and renders tangled cells, so nothing below may rely
+    on the writer.
+    """
+    mesh = Mesh(str(MESHDIR / AFFINE_MESHNAME))
+    V = FunctionSpace(mesh, "CG", 1)
+    f = Function(V, name="f")
+    _, vtu = _write_pvd(tmp_path, f)
+    points, cells, types, _ = _read_vtu(vtu)
+
+    coords, gmsh_cells = _read_gmsh22_prisms(MESHDIR / AFFINE_MESHNAME)
+    # _match_rows needs the gmsh nodes to be distinct.
+    assert np.unique(coords.round(10), axis=0).shape[0] == coords.shape[0]
+    by_vertices = {frozenset(int(v) for v in cell): [int(v) for v in cell]
+                   for cell in gmsh_cells}
+    assert len(by_vertices) == gmsh_cells.shape[0]
+
+    for cell in cells:
+        rows = [int(r) for r in _match_rows(points[cell], coords)]
+        assert len(set(rows)) == 6
+        gmsh_cell = by_vertices[frozenset(rows)]
+        first, second = rows[:3], rows[3:]
+        # The two triangular faces are contiguous triples. Which of the two
+        # comes first is free, so accept either and name them to suit.
+        near, far = gmsh_cell[:3], gmsh_cell[3:]
+        if set(first) != set(near):
+            near, far = far, near
+        assert set(first) == set(near)
+        assert set(second) == set(far)
+        # Node k of the first triple and node k of the second triple are the
+        # two ends of one axis edge.
+        for k in range(3):
+            assert far[near.index(first[k])] == second[k]
+
+
+@pytest.mark.parametrize("degree", [2, 3])
+def test_prism_vtk_output_writes_lagrange_wedge_cells(tmp_path, degree):
+    """Above degree 1 the cell type is VTK_LAGRANGE_WEDGE."""
+    mesh = Mesh(str(MESHDIR / AFFINE_MESHNAME))
+    V = FunctionSpace(mesh, "CG", degree)
+    f = Function(V, name="f")
+    _, vtu = _write_pvd(tmp_path, f)
+    points, cells, types, _ = _read_vtu(vtu)
+
+    _, gmsh_cells = _read_gmsh22_prisms(MESHDIR / AFFINE_MESHNAME)
+    assert types.size == gmsh_cells.shape[0]
+    assert np.all(types == VTK_LAGRANGE_WEDGE)
+    # A prism of degree k holds (k + 1)(k + 2)/2 nodes on the triangle and
+    # k + 1 on the axis.
+    assert cells.shape[1] == (degree + 1) * (degree + 2) // 2 * (degree + 1)
+
+
+@pytest.mark.parametrize("degree", [2, 3])
+def test_prism_vtk_output_points_sit_where_vtk_expects(tmp_path, degree):
+    """Every written node sits at the place its VTK local index names.
+
+    This extends the degree 1 node order test to the whole higher order
+    layout. The mesh is affine, so the degree 1 prism map through the 6 corners
+    gives the physical place of every node exactly.
+
+    Degree 1 is absent on purpose. The check below builds the map FROM the 6
+    written corners, so at degree 1, where the corners are the whole cell, it
+    reduces to got == got and holds whatever the permutation is. A mutation run
+    confirmed that: breaking the linear permutation left the degree 1 case
+    green. Degree 1 is covered instead by
+    test_prism_vtk_output_node_order_matches_the_mesh, which checks against the
+    gmsh file rather than against the written corners.
+    """
+    mesh = Mesh(str(MESHDIR / AFFINE_MESHNAME))
+    V = FunctionSpace(mesh, "CG", degree)
+    f = Function(V, name="f")
+    _, vtu = _write_pvd(tmp_path, f)
+    points, cells, types, _ = _read_vtu(vtu)
+
+    reference = _vtk_wedge_reference_points(degree)
+    assert cells.shape[1] == reference.shape[0]
+    for cell in cells:
+        got = points[cell]
+        expected = _prism_map(got[:6], reference)
+        assert np.allclose(got, expected, rtol=0, atol=1e-10)
+
+
+@pytest.mark.parametrize("degree", [1, 2, 3])
+def test_prism_vtk_output_point_data_matches_the_written_points(tmp_path, degree):
+    """The value written at a node is the value of the function at that node.
+
+    A linear function is in the space at every degree here, so the written
+    values must match it to round off.
+    """
+    mesh = Mesh(str(MESHDIR / AFFINE_MESHNAME))
+    V = FunctionSpace(mesh, "CG", degree)
+    x, y, z = SpatialCoordinate(mesh)
+    f = Function(V, name="linear").interpolate(2.0 * x - 3.0 * y + 5.0 * z + 1.0)
+    _, vtu = _write_pvd(tmp_path, f)
+    points, cells, types, point_data = _read_vtu(vtu)
+
+    expected = (2.0 * points[:, 0] - 3.0 * points[:, 1]
+                + 5.0 * points[:, 2] + 1.0)
+    assert np.allclose(point_data["linear"], expected, rtol=0, atol=1e-10)
+
+
+@pytest.mark.parametrize("meshname", MESHNAMES)
+def test_prism_vtk_output_round_trips_the_geometry(tmp_path, meshname):
+    """Every prism mesh writes, and the written cells hold the mesh vertices.
+
+    The warped mesh is not affine, so this checks the vertices only. It makes
+    no claim about where a higher order node sits on a warped cell.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    V = FunctionSpace(mesh, "CG", 1)
+    f = Function(V, name="f")
+    _, vtu = _write_pvd(tmp_path, f)
+    points, cells, types, _ = _read_vtu(vtu)
+
+    coords, gmsh_cells = _read_gmsh22_prisms(MESHDIR / meshname)
+    assert np.all(types == VTK_WEDGE)
+    assert cells.shape == (gmsh_cells.shape[0], 6)
+    written = sorted(sorted(_match_rows(points[cell], coords).tolist())
+                     for cell in cells)
+    expected = sorted(sorted(int(v) for v in cell) for cell in gmsh_cells)
+    assert written == expected
+
+
+def test_prism_vtk_output_takes_a_discontinuous_function(tmp_path):
+    """A discontinuous function reaches get_sup_element, which must not ask
+    for a "DQ" element on a prism."""
+    mesh = Mesh(str(MESHDIR / AFFINE_MESHNAME))
+    V = FunctionSpace(mesh, "DG", 1)
+    f = Function(V, name="f")
+    _, vtu = _write_pvd(tmp_path, f)
+    points, cells, types, _ = _read_vtu(vtu)
+    assert np.all(types == VTK_WEDGE)
+    # A discontinuous output does not share a node between two cells.
+    assert points.shape[0] == cells.shape[0] * 6
+
+
+def test_prism_sup_element_is_discontinuous_lagrange():
+    """get_sup_element must not ask for "DQ" on a prism.
+
+    "DQ" is registered on the hypercubes only, so it raises on a prism. The
+    discontinuous prism space is P_k(triangle) x P_k(interval), which is what
+    "DG" builds.
+    """
+    import finat.ufl
+    import ufl
+    from firedrake.output.vtk_output import get_sup_element
+
+    element = finat.ufl.FiniteElement("CG", cell=ufl.Cell("prism"), degree=2)
+    sup = get_sup_element(element, continuous=False)
+    assert sup.family() == "Discontinuous Lagrange"
+    assert sup.cell.cellname == "prism"
+    with pytest.raises(ValueError):
+        finat.ufl.FiniteElement("DQ", cell=ufl.Cell("prism"), degree=2)
+
+
+# The extruded wedge is the cell that the two shared functions this task edits
+# must not move. get_sup_element picks the family of every cell type, and
+# vtk_lagrange_wedge_reorder permutes the nodes of both wedge flavours.
+#
+# The value below was MEASURED on the branch before the change, and it is not
+# the value the source reads like. get_sup_element asks for the short name
+# "DQ", but finat.ufl rewrites a FiniteElement on a ufl.TensorProductCell into
+# a TensorProductElement with one factor per axis, and reports the factor
+# family. So the family that comes back is "Discontinuous Lagrange".
+EXTRUDED_WEDGE_SUP_FAMILY = "Discontinuous Lagrange"
+
+
+def test_extruded_wedge_sup_element_is_unchanged():
+    """get_sup_element must leave the extruded wedge where it was.
+
+    Adding "prism" to the "DG" set touches a function that every cell type
+    flows through. The extruded wedge does not move, because its cell is a
+    ufl.TensorProductCell, for which canonical_element_description sets the
+    cellname to None and skips the family check. This pins that, so the claim
+    is a measurement and not an argument.
+    """
+    import finat.ufl
+    import ufl
+    from firedrake.output.vtk_output import get_sup_element
+
+    wedge = ufl.TensorProductCell(ufl.Cell("triangle"), ufl.Cell("interval"))
+    element = finat.ufl.TensorProductElement(
+        finat.ufl.FiniteElement("CG", ufl.triangle, 2),
+        finat.ufl.FiniteElement("CG", ufl.interval, 2),
+        cell=wedge)
+    sup = get_sup_element(element, continuous=False)
+    assert sup.family() == EXTRUDED_WEDGE_SUP_FAMILY
+    assert sup.cell == wedge
+
+
+@pytest.mark.parametrize("degree", [1, 2, 3])
+def test_extruded_wedge_output_is_unchanged(tmp_path, degree):
+    """An extruded wedge still writes the wedge cell types it always wrote.
+
+    vtk_lagrange_wedge_reorder now routes the degree through as_tuple. An
+    extruded wedge reports the pair (k, k), which as_tuple leaves alone, so the
+    permutation must be the one it always was. A DG output also drives the
+    get_sup_element branch this task edits.
+
+    A linear function alone is a weak probe of a permutation, because many
+    wrong permutations leave it unchanged. The node place check below is the
+    one that answers the permutation question. A cell of a flat extrusion is
+    affine, so the degree 1 map through the 6 corners is exact, exactly as it
+    is on prism_slab.msh.
+    """
+    import ufl
+
+    mesh = ExtrudedMesh(UnitSquareMesh(3, 3), 3)
+    # An extruded triangle is a wedge, which is the cell under guard here.
+    assert mesh.ufl_cell() == ufl.TensorProductCell(ufl.Cell("triangle"),
+                                                    ufl.Cell("interval"))
+    x, y, z = SpatialCoordinate(mesh)
+    reference = _vtk_wedge_reference_points(degree)
+    for family in ("CG", "DG"):
+        V = FunctionSpace(mesh, family, degree)
+        f = Function(V, name="linear").interpolate(
+            2.0 * x - 3.0 * y + 5.0 * z + 1.0)
+        _, vtu = _write_pvd(tmp_path, f, name=f"wedge_{family}{degree}")
+        points, cells, types, point_data = _read_vtu(vtu)
+        expected_type = VTK_WEDGE if degree == 1 else VTK_LAGRANGE_WEDGE
+        assert np.all(types == expected_type)
+        assert cells.shape[1] == reference.shape[0]
+        assert cells.shape[1] == (degree + 1) * (degree + 2) // 2 * (degree + 1)
+        for cell in cells:
+            # The corner order, checked against the known shape of a flat
+            # extrusion rather than against the written corners. The two
+            # triangular faces sit at two constant heights, one above the
+            # other, so nodes 0, 1, 2 share a z, nodes 3, 4, 5 share the other
+            # z, and node k + 3 sits directly above node k. This does not go
+            # vacuous at degree 1, unlike the map check below.
+            corners = points[cell[:6]]
+            assert np.allclose(corners[:3, 2], corners[0, 2], rtol=0, atol=1e-12)
+            assert np.allclose(corners[3:, 2], corners[3, 2], rtol=0, atol=1e-12)
+            assert not np.isclose(corners[0, 2], corners[3, 2])
+            assert np.allclose(corners[:3, :2], corners[3:, :2],
+                               rtol=0, atol=1e-12)
+            # Every node sits at the place its VTK local index names. At
+            # degree 1 this reduces to got == got, so the corner check above
+            # is what carries that case.
+            got = points[cell]
+            assert np.allclose(got, _prism_map(got[:6], reference),
+                               rtol=0, atol=1e-10)
+        expected = (2.0 * points[:, 0] - 3.0 * points[:, 1]
+                    + 5.0 * points[:, 2] + 1.0)
+        assert np.allclose(point_data["linear"], expected, rtol=0, atol=1e-10)
+
+
+@pytest.mark.parametrize("degree", [2, 3, 4])
+def test_extruded_wedge_reorder_permutation_is_unchanged(degree):
+    """The as_tuple change must not move the extruded wedge permutation.
+
+    An extruded wedge reaches vtk_lagrange_wedge_reorder with the degree pair
+    (k, k). as_tuple leaves a pair alone, so the permutation must equal the one
+    the unchanged code computed from the same pair.
+
+    This guard is for the extruded wedge only. Do not extend it to a prism. A
+    prism reports a scalar degree, which is the whole reason the function
+    changed, so the inlined old body below raises a TypeError there.
+    """
+    import finat.ufl
+    import ufl
+    from firedrake.output.paraview_reordering import (firedrake_local_to_cart,
+                                                      invert,
+                                                      vtk_lagrange_wedge_reorder,
+                                                      vtk_wedge_local_to_cart)
+
+    wedge = ufl.TensorProductCell(ufl.Cell("triangle"), ufl.Cell("interval"))
+    element = finat.ufl.TensorProductElement(
+        finat.ufl.FiniteElement("CG", ufl.triangle, degree, variant="equispaced"),
+        finat.ufl.FiniteElement("CG", ufl.interval, degree, variant="equispaced"),
+        cell=wedge)
+    assert element.degree() == (degree, degree)
+    # The right hand side is the body of the unchanged function.
+    assert vtk_lagrange_wedge_reorder(element) == invert(
+        vtk_wedge_local_to_cart(element.degree()),
+        firedrake_local_to_cart(element))
