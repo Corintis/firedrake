@@ -4,8 +4,7 @@ The meshes come from ``prism_meshes/`` at the repository root. They hold
 ``DM_POLYTOPE_TRI_PRISM`` cells, which is the only prism cell type that this
 code supports. Facet integrals (``ds``) are not part of these tests.
 
-Two gaps stopped a prism mesh above degree 1. Task 2b closed the first one. The
-second one still has an xfail test below that turns green when Task 2c closes it.
+Two gaps stopped a prism mesh above degree 1. Both are closed.
 
 Gap 1, Task 2b, the global numbering. CLOSED. ``create_section`` used to give
 every plex point of the same topological dimension the same number of dofs. The
@@ -16,14 +15,19 @@ referenced, and a stiffness matrix had one empty row per triangular face and was
 singular. The numbering now keys the dof count on the DMPlex polytope type of the
 point. See ``_numbering_strata`` in ``firedrake/mesh.py``. CG2 works from here.
 
-Gap 2, Task 2c, the orientation of a quadrilateral face. ``_compute_orientation``
-reports orientation 4 or 6 for every quadrilateral face of a prism, that is
-``eo = 1``: PETSc orders the cone of a TRI_PRISM quadrilateral face with its
-axes transposed against the UFCQuadrilateral convention. The FInAT prism
-element supplies only 4 orientations for such a face, the ``eo = 0`` half,
-because a prism quadrilateral is a triangle edge times the interval and those
-two axes can not be exchanged. A hexahedron face supplies 8. The orientation
-therefore indexes past the permutation table.
+Gap 2, Task 2c, the orientation of a quadrilateral face. CLOSED. A quadrilateral
+face of a prism receives all 8 orientations of a quadrilateral, but the FInAT
+prism element supplied only the 4 with extrinsic part 0, so ``get_cell_nodes``
+indexed past the end of the permutation table. The element now supplies all 8.
+See ``_make_axis_perms_tensorproduct`` in ``FIAT/orientation_utils.py``.
+
+The fix belongs in FIAT, not in Firedrake, because the gap is real. The mesh
+``prism_two_perpendicular.msh`` holds two prisms whose axes are PERPENDICULAR
+and which share a quadrilateral face. The two cells report different extrinsic
+parts for that one face, so no convention on the Firedrake side puts both of
+them inside a 4-entry table. The test named
+``test_prism_perpendicular_cells_disagree_on_the_extrinsic_part`` below pins
+that, and it is the case that this whole task exists for.
 """
 import itertools
 from pathlib import Path
@@ -33,12 +37,27 @@ import pytest
 
 from firedrake import (Constant, DirichletBC, Function, FunctionSpace, Mesh,
                        SpatialCoordinate, TestFunction, TrialFunction,
-                       assemble, dx, grad, inner, solve)
+                       UnitCubeMesh, assemble, dx, grad, inner, solve)
 from firedrake.petsc import PETSc
 
 
 MESHDIR = Path(__file__).parents[3] / "prism_meshes"
-MESHNAMES = ("prism_reference.msh", "prism_slab.msh", "prism_warped.msh")
+MESHNAMES = ("prism_reference.msh", "prism_slab.msh", "prism_warped.msh",
+             "prism_two_perpendicular.msh")
+
+# The meshes that hold more than one cell, so they have interior faces.
+MULTICELL_MESHNAMES = ("prism_slab.msh", "prism_warped.msh",
+                       "prism_two_perpendicular.msh")
+
+# The two cells of prism_two_perpendicular.msh meet on a quadrilateral face
+# only, so that mesh has no interior triangular face to check.
+TRIANGLE_SHARING_MESHNAMES = ("prism_slab.msh", "prism_warped.msh")
+
+# Closure column of each FIAT face of a prism. The closure holds 6 vertices,
+# then 9 edges, then the 3 quadrilateral faces, then the 2 triangular faces,
+# then the cell.
+QUAD_FACE_COLUMNS = (15, 16, 17)
+TRIANGLE_FACE_COLUMNS = (18, 19)
 
 pytestmark = pytest.mark.skipif(
     not MESHDIR.is_dir(),
@@ -209,73 +228,7 @@ def test_prism_cell_orientation_is_zero(meshname):
 
 # ------------------------------------------------------------------ assembly
 
-_GAP2_UNSAFE_HEAD = (
-    "Task 2c, gap 2. DO NOT DELETE THIS SKIP AS MERELY UNSUPPORTED. The test "
-    "PASSES today, but only because an out-of-bounds read returned 0 in this "
-    "build. At CG2 and above a quadrilateral face carries dofs, so "
-    "get_cell_nodes indexes the permutation table past its end under "
-    "boundscheck(False): at CG2 the read is index 36 of a 36 element array. "
-)
-_GAP2_UNSAFE_TAIL = " Re-enable this when gap 2 is closed."
-
-CG2_CORRECT_BUT_NOT_YET_SAFE = """\
-Task 2c, gap 2. DO NOT READ A GREEN CG2 TEST AS "CG2 IS MEMORY SAFE".
-
-Separate the result from the read.
-
-The RESULT is correct, and for a structural reason, not by luck. At CG2 a
-quadrilateral face carries exactly ONE interior dof, and the only permutation of
-a one element set is the identity. No orientation, in range or out of range, can
-misorder a single dof. So the dof numbering that Task 2b gives is the whole
-answer at this degree, and these tests measure it honestly.
-
-The READ is still unsafe. get_cell_nodes indexes the permutation table past its
-end under boundscheck(False), because a prism quadrilateral face presents all 8
-orientations while the FInAT element supplies only the 4 with extrinsic part 0.
-That is undefined behaviour whatever value it returns. Task 2c removes it, and
-Task 2c has to re-run these tests once it does.
-
-From CG3 upwards a quadrilateral face carries 4 or more dofs, the identity
-argument fails, and the result is wrong as well. The CG3 and CG4 cases below are
-strict xfails for exactly that reason.
-"""
-
-CG3_RESULT_IS_UNVERIFIED = (
-    "Task 2c, gap 2. DO NOT DELETE THIS SKIP AS MERELY UNSUPPORTED. The test "
-    "PASSES today, and that is why it is skipped. This is NOT the CG2 case "
-    "above. At CG2 a quadrilateral face carries one dof, the only permutation "
-    "of a one element set is the identity, and the result is therefore correct "
-    "for a structural reason. At CG3 a quadrilateral face carries 4 dofs, the "
-    "FInAT element supplies only the 4 orientations with extrinsic part 0, and "
-    "the shipped prism meshes present the values 4 and 6 as well. The "
-    "permutation then selects between genuinely different answers. So at CG3 "
-    "the read in get_cell_nodes is out of bounds AND the result it produces is "
-    "unverified: this test passes on a memory layout accident, not for a "
-    "reason. Re-enable it when gap 2 is closed."
-)
-
-GAP2_UNSAFE_MASS = (
-    _GAP2_UNSAFE_HEAD
-    + "The assertion can not detect the defect either, because a mass matrix "
-      "total equals the cell volume even when dofs land on the wrong entity."
-    + _GAP2_UNSAFE_TAIL
-)
-
-GAP2_UNSAFE_INTERP = (
-    _GAP2_UNSAFE_HEAD
-    + "This case asserts an L2 interpolation error, which CAN detect the "
-      "defect, and does so from CG3 upwards, where those two cases are strict "
-      "xfails. At CG2 a quadrilateral face carries one dof, so the defect "
-      "stays invisible to the assertion as long as the read returns 0."
-    + _GAP2_UNSAFE_TAIL
-)
-
-
-@pytest.mark.parametrize("degree", [
-    1,
-    pytest.param(2, marks=pytest.mark.skip(reason=GAP2_UNSAFE_MASS)),
-    pytest.param(3, marks=pytest.mark.skip(reason=GAP2_UNSAFE_MASS)),
-])
+@pytest.mark.parametrize("degree", [1, 2, 3, 4])
 def test_prism_mass_matrix_total_is_the_volume(degree):
     mesh = Mesh(str(MESHDIR / "prism_reference.msh"))
     V = FunctionSpace(mesh, "CG", degree)
@@ -299,16 +252,7 @@ def test_prism_slab_volume_from_the_gmsh_geometry():
 
 # ------------------------------------------------------------- interpolation
 
-@pytest.mark.parametrize("degree", [
-    1,
-    pytest.param(2, marks=pytest.mark.skip(reason=GAP2_UNSAFE_INTERP)),
-    pytest.param(3, marks=pytest.mark.xfail(
-        strict=True, reason="Task 2c, gap 2: the quadrilateral face orientation "
-                            "is out of the range the FInAT prism element supplies")),
-    pytest.param(4, marks=pytest.mark.xfail(
-        strict=True, reason="Task 2c, gap 2: the quadrilateral face orientation "
-                            "is out of the range the FInAT prism element supplies")),
-])
+@pytest.mark.parametrize("degree", [1, 2, 3, 4])
 def test_prism_interpolation_is_exact_on_one_cell(degree):
     """A polynomial of P_k(triangle) x P_k(interval) interpolates exactly."""
     mesh = Mesh(str(MESHDIR / "prism_reference.msh"))
@@ -322,10 +266,8 @@ def test_prism_interpolation_is_exact_on_one_cell(degree):
 
 # ------------------------------------------------------------------- Poisson
 
-# Task 2b turns the degree 2 case on. See CG2_CORRECT_BUT_NOT_YET_SAFE above:
-# the result is correct, the permutation read is not yet in bounds.
 @pytest.mark.parallel([1, 2, 3])
-@pytest.mark.parametrize("degree", [1, 2])
+@pytest.mark.parametrize("degree", [1, 2, 3])
 def test_prism_poisson_with_strong_dirichlet(degree):
     """A harmonic polynomial of the FE space is reproduced exactly."""
     mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
@@ -346,10 +288,7 @@ def test_prism_poisson_with_strong_dirichlet(degree):
 
 # --------------------------------------------------- the dof numbering, gap 1
 #
-# Task 2b closed gap 1, so the tests below pass. Every one of them that builds a
-# space of degree 2 or more also performs the out of bounds permutation read that
-# CG2_CORRECT_BUT_NOT_YET_SAFE describes. Read that text before you take a green
-# result here as a statement about memory safety.
+# Task 2b closed gap 1, so the tests below pass.
 
 # The plex entity counts of prism_slab.msh. test_prism_slab_entity_counts below
 # checks them against the mesh itself.
@@ -437,10 +376,7 @@ def test_prism_dofs_per_plex_entity(degree):
 
 
 @pytest.mark.parallel([1, 2, 3])
-@pytest.mark.parametrize("degree", [
-    2,
-    pytest.param(3, marks=pytest.mark.skip(reason=CG3_RESULT_IS_UNVERIFIED)),
-])
+@pytest.mark.parametrize("degree", [2, 3, 4])
 def test_prism_function_space_has_no_unreferenced_dofs(degree):
     """Every node of the space is referenced by the cell node map."""
     mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
@@ -466,16 +402,275 @@ def test_prism_cg2_mass_matrix_has_no_empty_row():
     assert empty == []
 
 
-# ---------------------------------------------------------- the known gap, 2
+# ------------------------------------ the quadrilateral face orientation, gap 2
+#
+# A quadrilateral face of a prism carries all 8 orientations of a
+# quadrilateral: 2 axis permutations times 2 reflections per axis. The FInAT
+# prism element used to supply only the 4 with extrinsic part 0, so
+# get_cell_nodes indexed the permutation table past its end.
+#
+# The helpers below check the dof numbering against the physical position of
+# each dof, which is what "the orientation selects the right permutation"
+# means. They do not consult the permutation table at all, so a table that
+# merely has the right LENGTH does not satisfy them.
 
-@pytest.mark.xfail(strict=True, reason="Task 2c, gap 2: PETSc transposes the "
-                                       "axes of a TRI_PRISM quadrilateral face "
-                                       "cone")
-def test_prism_quad_face_orientations_are_in_range(meshname):
+
+def _reference_dof_points(V):
+    """The reference prism coordinates of every local dof of V, in dof order."""
+    nodes = V.finat_element.fiat_equivalent.dual.nodes
+    points = []
+    for node in nodes:
+        point, = node.get_point_dict().keys()
+        points.append(point)
+    return np.asarray(points, dtype=float)
+
+
+def _physical_dof_points(mesh, V):
+    """The physical coordinates of every local dof, per cell.
+
+    :returns: An array of shape (ncells, ndofs, gdim).
+
+    The map of a prism cell of a degree 1 coordinate field is linear on the
+    triangle and linear on the interval, so it is written out here directly
+    from the six vertex coordinates. This does not go through the element, so
+    it is an independent statement of where each dof sits.
+    """
+    reference = _reference_dof_points(V)
+    coordinates = mesh.coordinates
+    vertex_map = coordinates.function_space().cell_node_map().values
+    data = coordinates.dat.data_ro_with_halos
+    x, y, z = reference[:, 0], reference[:, 1], reference[:, 2]
+    # Barycentric coordinates on the triangle factor.
+    barycentric = np.stack([1.0 - x - y, x, y], axis=1)
+    points = np.empty((vertex_map.shape[0], reference.shape[0], data.shape[1]))
+    for cell in range(vertex_map.shape[0]):
+        vertices = data[vertex_map[cell]]
+        # FIAT prism vertex v is triangle vertex v // 2 at interval end v % 2.
+        bottom = barycentric @ vertices[0::2]
+        top = barycentric @ vertices[1::2]
+        points[cell] = (1.0 - z)[:, None] * bottom + z[:, None] * top
+    return points
+
+
+def _interior_faces(mesh, columns):
+    """The interior faces of the given closure columns.
+
+    :arg columns: The closure columns to walk, one per FIAT face.
+    :returns: A list of pairs of (cell, column), one pair per interior face.
+    """
+    closure = mesh.topology.cell_closure
+    incident = {}
+    for cell in range(closure.shape[0]):
+        for column in columns:
+            incident.setdefault(int(closure[cell, column]), []).append((cell, column))
+    return [pair for pair in incident.values() if len(pair) == 2]
+
+
+def _assert_shared_face_dofs_agree(meshname, degree, columns, dofs_per_face):
+    """Both cells of every interior face give its dofs the same global nodes.
+
+    They must also give them in the order that puts each node at one physical
+    point. A permutation that merely reaches the right SET of nodes reorders
+    the face and puts a node at two different places, which this detects.
+    """
     mesh = Mesh(str(MESHDIR / meshname))
+    V = FunctionSpace(mesh, "CG", degree)
+    nodes = V.cell_node_map().values
+    points = _physical_dof_points(mesh, V)
+    entity_dofs = V.finat_element.entity_dofs()
+
+    faces = _interior_faces(mesh, columns)
+    assert faces, f"{meshname} has no interior face in columns {columns}"
+    for (cell_a, column_a), (cell_b, column_b) in faces:
+        dofs_a = entity_dofs[2][column_a - 15]
+        dofs_b = entity_dofs[2][column_b - 15]
+        assert len(dofs_a) == len(dofs_b) == dofs_per_face
+        if dofs_per_face == 0:
+            continue
+        nodes_a = [int(nodes[cell_a, dof]) for dof in dofs_a]
+        nodes_b = [int(nodes[cell_b, dof]) for dof in dofs_b]
+        assert sorted(nodes_a) == sorted(nodes_b)
+        # The node that each cell puts at a given physical point is the same.
+        place_a = {node: points[cell_a, dof] for node, dof in zip(nodes_a, dofs_a)}
+        place_b = {node: points[cell_b, dof] for node, dof in zip(nodes_b, dofs_b)}
+        for node in place_a:
+            assert np.allclose(place_a[node], place_b[node], rtol=0, atol=1e-12)
+
+
+@pytest.mark.parametrize("degree", [2, 3, 4])
+def test_prism_quad_face_orientations_are_in_range(meshname, degree):
+    """Every orientation a face receives indexes inside its permutation table."""
+    mesh = Mesh(str(MESHDIR / meshname))
+    V = FunctionSpace(mesh, "CG", degree)
+    permutations = V.finat_element.entity_permutations
+    orientations = mesh.topology.entity_orientations
+    for face in range(5):
+        table = permutations[2][face]
+        column = 15 + face
+        assert sorted(table) == list(range(len(table)))
+        assert orientations[:, column].max() < len(table)
+        assert orientations[:, column].min() >= 0
+    # The quadrilateral faces supply 8 orientations and the triangular faces 6.
+    assert [len(permutations[2][face]) for face in range(3)] == [8, 8, 8]
+    assert [len(permutations[2][face]) for face in (3, 4)] == [6, 6]
+
+
+def test_prism_quad_faces_reach_the_second_axis_permutation(meshname):
+    """The shipped meshes do present orientations that the old table lacked.
+
+    Without this the test above is satisfied by a mesh that never leaves the
+    first four orientations, and the widened table would guard nothing.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    orientations = mesh.topology.entity_orientations
+    quad = orientations[:, list(QUAD_FACE_COLUMNS)]
+    assert quad.max() >= 4
+
+
+def test_prism_perpendicular_cells_disagree_on_the_extrinsic_part():
+    """Two prisms with perpendicular axes share a quadrilateral face.
+
+    This is the mesh that decides the shape of the fix. The two cells report
+    different extrinsic parts for the same face, so there is no single frame
+    in which both of them sit in a 4-entry table. Transposing the face cone
+    puts one cell right and the other wrong.
+    """
+    mesh = Mesh(str(MESHDIR / "prism_two_perpendicular.msh"))
+    orientations = mesh.topology.entity_orientations
+    assert orientations.shape[0] == 2
+
+    faces = _interior_faces(mesh, QUAD_FACE_COLUMNS)
+    assert len(faces) == 1
+    (cell_a, column_a), (cell_b, column_b) = faces[0]
+    orientation_a = int(orientations[cell_a, column_a])
+    orientation_b = int(orientations[cell_b, column_b])
+    # The orientation is (2 ** 2) * extrinsic + intrinsic for a quadrilateral.
+    assert orientation_a // 4 != orientation_b // 4
+    assert {orientation_a, orientation_b} == {1, 6}
+
+    # The two cells really do have perpendicular axes. The axis of a prism runs
+    # along its edges 0, 1 and 2, which are the edges of the closure columns
+    # 6, 7 and 8.
+    coordinates = mesh.coordinates.dat.data_ro_with_halos
+    closure = mesh.topology.cell_closure
+    plex = mesh.topology.topology_dm
+    vertex_start, _ = plex.getDepthStratum(0)
+    axes = []
+    for cell in (cell_a, cell_b):
+        cone = plex.getCone(int(closure[cell, 6]))
+        tail, head = (coordinates[int(v) - vertex_start] for v in cone)
+        direction = head - tail
+        axes.append(direction / np.linalg.norm(direction))
+    assert np.isclose(abs(float(np.dot(axes[0], axes[1]))), 0.0, atol=1e-12)
+
+
+@pytest.mark.parametrize("meshname", MULTICELL_MESHNAMES)
+@pytest.mark.parametrize("degree", [2, 3, 4])
+def test_prism_interior_quad_face_dofs_agree(meshname, degree):
+    """Both cells of every interior quadrilateral face agree on its dofs."""
+    _assert_shared_face_dofs_agree(meshname, degree, QUAD_FACE_COLUMNS,
+                                   (degree - 1) ** 2)
+
+
+@pytest.mark.parametrize("meshname", TRIANGLE_SHARING_MESHNAMES)
+@pytest.mark.parametrize("degree", [2, 3, 4])
+def test_prism_interior_triangular_face_dofs_agree(meshname, degree):
+    """The triangular faces are a regression guard: they must not move."""
+    _assert_shared_face_dofs_agree(meshname, degree, TRIANGLE_FACE_COLUMNS,
+                                   (degree - 1) * (degree - 2) // 2)
+
+
+def test_prism_perpendicular_mesh_shares_no_triangular_face():
+    """Say why the triangular test above skips the perpendicular mesh.
+
+    The two prisms meet on a quadrilateral face only. If a later change gives
+    them a shared triangular face as well, add the mesh to
+    TRIANGLE_SHARING_MESHNAMES rather than deleting this test.
+    """
+    mesh = Mesh(str(MESHDIR / "prism_two_perpendicular.msh"))
+    assert _interior_faces(mesh, TRIANGLE_FACE_COLUMNS) == []
+
+
+@pytest.mark.parametrize("degree", [1, 2, 3, 4])
+def test_prism_every_node_sits_at_one_physical_point(meshname, degree):
+    """No global node is claimed by two cells for two different places.
+
+    This is the whole-mesh form of the face tests above, and it also covers
+    the edges and the vertices. Before the fix it failed from CG3 upwards, by
+    as much as 0.63 of a cell width.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    V = FunctionSpace(mesh, "CG", degree)
+    nodes = V.cell_node_map().values
+    points = _physical_dof_points(mesh, V)
+
+    place = {}
+    for cell in range(nodes.shape[0]):
+        for dof in range(nodes.shape[1]):
+            node = int(nodes[cell, dof])
+            point = points[cell, dof]
+            if node in place:
+                assert np.allclose(place[node], point, rtol=0, atol=1e-12)
+            else:
+                place[node] = point
+    # Distinct nodes sit at distinct points, so no dof was dropped either.
+    stacked = np.array([place[node] for node in sorted(place)])
+    assert np.unique(stacked.round(10), axis=0).shape[0] == len(place)
+
+
+@pytest.mark.parametrize("degree", [2, 3, 4])
+def test_prism_permutation_reads_stay_inside_the_table(meshname, degree):
+    """get_cell_nodes never indexes past the end of the permutation buffer.
+
+    get_cell_nodes reads entity_permutations_c[perm_offset + ndofs * orient + j]
+    with 0 <= j < ndofs, under boundscheck(False). This walks the same offsets
+    and asserts the largest of them is inside the buffer. At CG2 on
+    prism_reference.msh the largest index used to be 36 of a 36 element buffer.
+    """
+    from firedrake.cython.dmcommon import _make_entity_permutations_c
+
+    mesh = Mesh(str(MESHDIR / meshname))
+    V = FunctionSpace(mesh, "CG", degree)
+    entity_dofs = V.finat_element.entity_dofs()
+    buffer, num_orientations = _make_entity_permutations_c(
+        entity_dofs, V.finat_element.entity_permutations)
+    ndofs = [len(entity_dofs[dim][entity]) for dim in sorted(entity_dofs)
+             for entity in range(len(entity_dofs[dim]))]
+    orientations = mesh.topology.entity_orientations
+
+    highest = -1
+    for cell in range(orientations.shape[0]):
+        offset = 0
+        for slot, count in enumerate(ndofs):
+            if count > 0:
+                orient = int(orientations[cell, slot])
+                highest = max(highest, offset + count * orient + count - 1)
+            offset += count * int(num_orientations[slot])
+    assert highest < len(buffer)
+
+
+def test_prism_cg3_quad_face_nodes_are_four_distinct_nodes():
+    """The reference cell at CG3: face 2 must not collapse onto one node.
+
+    Before the fix this face read the wrong block of the permutation buffer
+    and returned the same node four times.
+    """
+    mesh = Mesh(str(MESHDIR / "prism_reference.msh"))
+    V = FunctionSpace(mesh, "CG", 3)
+    entity_dofs = V.finat_element.entity_dofs()
+    nodes = V.cell_node_map().values[0]
+    face_nodes = [int(nodes[dof]) for dof in entity_dofs[2][2]]
+    assert len(face_nodes) == 4
+    assert len(set(face_nodes)) == 4
+
+
+def test_hexahedron_face_still_supplies_eight_orientations():
+    """The regression guard on the cell the fix must not have moved."""
+    mesh = UnitCubeMesh(2, 2, 2, hexahedral=True)
     V = FunctionSpace(mesh, "CG", 3)
     permutations = V.finat_element.entity_permutations
-    eo = mesh.topology.entity_orientations
-    for face in range(5):
-        column = 15 + face
-        assert eo[:, column].max() < len(permutations[2][face])
+    for face in range(6):
+        assert sorted(permutations[2][face]) == list(range(8))
+    orientations = mesh.topology.entity_orientations
+    # A hexahedron closure is 8 vertices, 12 edges, 6 faces, then the cell.
+    assert orientations[:, 20:26].max() < 8

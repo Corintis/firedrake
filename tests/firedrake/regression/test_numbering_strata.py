@@ -94,7 +94,8 @@ def test_node_classes_count_every_node_once_in_parallel(mesh_name, degree):
     """The owned node counts of all ranks add up to V.dim().
 
     This is partition independent, so it stays true when the partitioner
-    changes. The serial test above pins the exact numbers.
+    changes. The serial test above pins the exact numbers, and
+    test_node_classes_split_matches_the_plex below pins the split.
     """
     mesh = MESH_MAKERS[mesh_name]()
     V = FunctionSpace(mesh, "CG", degree)
@@ -204,3 +205,98 @@ def test_entity_classes_per_stratum_on_a_split_dimension():
         (3, None),
     )
     _check_the_split(topology)
+
+
+# ------------------------------------- the core / owned / ghost node split
+
+def _nodes_per_stratum(topology, nodes_per_entity):
+    """One node count per numbering stratum.
+
+    An extruded mesh reports a pair per base mesh stratum: the nodes ON the
+    entity of each of its ``layers`` levels, and the nodes ABOVE it in each of
+    the ``layers - 1`` cells of the column. Every other mesh reports one number
+    per stratum already.
+    """
+    nodes = np.asarray(nodes_per_entity)
+    if nodes.ndim == 1:
+        return [int(count) for count in nodes]
+    layers = topology.layers
+    return [int(count) for count in
+            sum(nodes[:, i] * (layers - i) for i in range(2))]
+
+
+def _node_classes_from_the_plex(topology, nodes_per_stratum):
+    """The core / owned / ghost node counts, cumulative, counted point by point.
+
+    This does not restate ``node_classes``, which multiplies the node counts by
+    ``_entity_classes_per_stratum``. It walks the plex points of each stratum
+    and asks which class each one belongs to, taking the ghosts from the point
+    SF rather than from the PyOP2 labels.
+    """
+    plex = topology.topology_dm
+    _, local, _ = plex.getPointSF().getGraph()
+    leaves = set() if local is None else {int(point) for point in local}
+    if plex.getStratumSize("pyop2_core", 1) > 0:
+        core_points = {int(point) for point in plex.getStratumIS("pyop2_core", 1).indices}
+    else:
+        core_points = set()
+
+    core = owned = ghost = 0
+    for nodes, points in zip(nodes_per_stratum, _stratum_points(topology)):
+        for point in points:
+            if point in leaves:
+                ghost += nodes
+            elif point in core_points:
+                core += nodes
+            else:
+                owned += nodes
+    return (core, core + owned, core + owned + ghost)
+
+
+def _check_the_node_split(mesh, degree):
+    topology = mesh.topology
+    V = FunctionSpace(mesh, "CG", degree)
+    nodes_per_entity = tuple(
+        topology.make_dofs_per_plex_entity(V.finat_element.entity_dofs()))
+    got = tuple(int(count) for count in topology.node_classes(nodes_per_entity))
+
+    assert got == _node_classes_from_the_plex(
+        topology, _nodes_per_stratum(topology, nodes_per_entity))
+    # The PyOP2 Set that the space is built on reports the same three numbers.
+    assert got == tuple(int(size) for size in V.node_set.sizes)
+    assert mesh.comm.allreduce(got[1]) == V.dim()
+
+    # Guard against a vacuous pass. In serial the three numbers are all V.dim(),
+    # which says nothing, so every rank must see ghost nodes and some rank must
+    # hold core nodes. A rank whose whole partition touches the halo has none.
+    assert got[2] > got[1]
+    assert mesh.comm.allreduce(got[0]) > 0
+
+
+@pytest.mark.parallel([2, 3])
+@pytest.mark.parametrize("mesh_name", sorted(MESH_MAKERS))
+@pytest.mark.parametrize("degree", [1, 3])
+def test_node_classes_split_matches_the_plex(mesh_name, degree):
+    """The core / owned / ghost node counts, not just their total.
+
+    In serial all three are V.dim(), so only a parallel run says anything.
+    """
+    _check_the_node_split(MESH_MAKERS[mesh_name](), degree)
+
+
+@pytest.mark.skipif(not PRISM_MESH.exists(), reason="no prism mesh in the tree")
+@pytest.mark.parallel([2, 3])
+@pytest.mark.parametrize("degree", [1, 2, 3, 4])
+def test_node_classes_split_on_a_split_dimension(degree):
+    """The prism mesh gives its two dimension 2 strata different node counts.
+
+    A per-dimension split would give the triangular and the quadrilateral
+    faces the same count, so this is the case the per-stratum split exists for.
+    """
+    mesh = Mesh(str(PRISM_MESH))
+    nodes_per_entity = tuple(mesh.topology.make_dofs_per_plex_entity(
+        FunctionSpace(mesh, "CG", degree).finat_element.entity_dofs()))
+    triangle, quadrilateral = nodes_per_entity[2], nodes_per_entity[3]
+    assert triangle == (degree - 1) * (degree - 2) // 2
+    assert quadrilateral == (degree - 1) ** 2
+    _check_the_node_split(mesh, degree)
