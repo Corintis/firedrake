@@ -2036,6 +2036,43 @@ def test_prism_ds_marker_that_holds_both_facet_shapes():
 
 
 @pytest.mark.parallel([1, 2, 3])
+def test_prism_ds_otherwise_excludes_the_marked_facets():
+    """ds + ds(4) makes an "otherwise" kernel for the facets outside marker 4.
+
+    UFL adds the everywhere integrand to the ds(4) integrand, and gives the
+    rest of the boundary an "otherwise" integral. Marker 4 holds triangles and
+    quadrilaterals, so each shape kernel must remove it from "otherwise".
+    """
+    mesh = Mesh(str(MESHDIR / MIXED_MARKER_MESHNAME))
+    got = assemble(Constant(1.0) * ds(domain=mesh) + Constant(1.0) * ds(4, domain=mesh))
+    assert np.isclose(got, SLAB_SURFACE_AREA + MIXED_MARKER_AREAS[4], rtol=0, atol=1e-12)
+
+
+def _subdomain_data_error(mesh):
+    """The error of a ds with subdomain data, which only a cell integral supports.
+
+    The subdomain data of an integral is an iteration set. Here it is the
+    subset of the exterior facets in marker 1.
+    """
+    data = mesh.topology.exterior_facets.subset(1)
+    with pytest.raises(NotImplementedError) as error:
+        assemble(Constant(1.0) * ds(domain=mesh, subdomain_data=data))
+    return str(error.value)
+
+
+def test_prism_ds_with_subdomain_data_is_rejected_as_on_other_meshes():
+    """The subdomain data of a prism ds must not be dropped at the split.
+
+    The assembler holds the form from before the split, whose subdomain data
+    is under "exterior_facet". A missed lookup would run the kernels over every
+    facet and ignore the data.
+    """
+    prism = _subdomain_data_error(Mesh(str(MESHDIR / "prism_slab.msh")))
+    tetrahedron = _subdomain_data_error(UnitCubeMesh(1, 1, 1))
+    assert prism == tetrahedron == "subdomain_data only supported with cell integrals"
+
+
+@pytest.mark.parallel([1, 2, 3])
 def test_prism_ds_facet_subsets_hold_the_facets_of_one_shape():
     """Each kernel iterates over the facets of its shape in the marker only.
 
@@ -2161,10 +2198,21 @@ def test_prism_ds_matrix_rows_match_a_vector_assembly():
     assert np.isclose(Ax.sum(), assemble(Constant(1.0) * ds(domain=mesh)), rtol=0, atol=1e-12)
 
 
+def test_prism_slate_facet_integral_is_rejected():
+    """Slate on a prism ds fails with a message, not a KeyError or a number."""
+    from firedrake import Tensor
+
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    V = FunctionSpace(mesh, "DG", 1)
+    u, v = TrialFunction(V), TestFunction(V)
+    with pytest.raises(NotImplementedError, match="Slate does not support facet integrals on prism"):
+        assemble(Tensor(inner(u, v) * ds(domain=mesh)))
+
+
 def test_prism_interior_facet_integral_is_rejected():
     """dS on a prism is out of scope, and fails with a message, not a number."""
     mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
-    with pytest.raises(ValueError, match="more than one shape"):
+    with pytest.raises(NotImplementedError, match="not supported on prism meshes"):
         assemble(Constant(1.0) * dS(domain=mesh))
 
 

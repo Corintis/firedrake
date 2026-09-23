@@ -444,6 +444,12 @@ def lower_integral_type(fiat_cell, integral_type):
         if isinstance(fiat_cell, TensorProductCell):
             raise ValueError("{} integral cannot be used with a TensorProductCell; need to distinguish between vertical and horizontal contributions.".format(integral_type))
         integration_dim = dim - 1
+        if len(facet_shape_entities(fiat_cell, integration_dim)) > 1 and integral_type == 'interior_facet':
+            # A split by facet shape does not help here: an interior facet
+            # integral also needs the two cells of a facet to agree on it.
+            raise NotImplementedError(
+                "interior_facet integrals (dS) are not supported on prism "
+                "meshes, or on any cell whose facets have more than one shape.")
         if len(facet_shape_entities(fiat_cell, integration_dim)) > 1:
             raise ValueError(
                 "{} integral cannot be used with this cell; its facets have "

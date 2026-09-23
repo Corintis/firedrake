@@ -85,7 +85,11 @@ def test_prism_exterior_facet_is_rejected():
     with pytest.raises(ValueError) as excinfo:
         lower_integral_type(PRISM, "exterior_facet")
     assert "more than one shape" in str(excinfo.value)
-    with pytest.raises(ValueError):
+
+
+def test_prism_interior_facet_is_not_supported():
+    """dS on a prism is out of scope. A split by facet shape does not fix it."""
+    with pytest.raises(NotImplementedError, match="not supported on prism meshes"):
         lower_integral_type(PRISM, "interior_facet")
 
 

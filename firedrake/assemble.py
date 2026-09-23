@@ -1747,7 +1747,7 @@ class _GlobalKernelBuilder:
     @cached_property
     def _needs_subset(self):
         subdomain_data = self._form.subdomain_data()[self._mesh]
-        if not all(sd is None for sd in subdomain_data.get(self._integral_type, [None])):
+        if not all(sd is None for sd in subdomain_data.get(_subdomain_data_integral_type(self._integral_type), [None])):
             return True
 
         if self._integral_type in shape_facet_types:
@@ -2142,7 +2142,7 @@ class ParloopBuilder:
     @cached_property
     def _iterset(self):
         try:
-            subdomain_data = self._form.subdomain_data()[self._mesh][self._integral_type]
+            subdomain_data = self._form.subdomain_data()[self._mesh][_subdomain_data_integral_type(self._integral_type)]
         except KeyError:
             subdomain_data = [None]
 
@@ -2172,6 +2172,16 @@ class ParloopBuilder:
         """
         # TODO Make singledispatchmethod with Python 3.8
         return _as_parloop_arg(tsfc_arg, self)
+
+
+def _subdomain_data_integral_type(integral_type):
+    """The integral type under which the form holds the subdomain data of a kernel.
+
+    compile_form splits an ``exterior_facet`` integral on a prism into the
+    types of ``shape_facet_types``, but the assembler holds the form from
+    before the split. Its subdomain data is under ``exterior_facet``.
+    """
+    return "exterior_facet" if integral_type in shape_facet_types else integral_type
 
 
 @functools.singledispatch

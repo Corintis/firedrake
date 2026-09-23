@@ -14,6 +14,7 @@ import firedrake.slate.slate as slate
 from firedrake.slate.slac.tsfc_driver import compile_terminal_form
 
 from tsfc import kernel_args
+from tsfc.kernel_interface.common import shape_facet_types
 from finat.element_factory import create_element
 from tsfc.loopy import create_domains, assign_dtypes
 
@@ -450,6 +451,17 @@ class LocalLoopyKernelBuilder:
                         if subdomain_id != "otherwise":
                             raise NotImplementedError("No subdomain markers for cells yet")
                     elif self.is_integral_type(integral_type, "facet_integral"):
+                        if kinfo.integral_type in shape_facet_types:
+                            # Slate passes the FIAT facet number of its loop
+                            # over the cell facets (fidx, see
+                            # facet_integral_predicates) to the kernel. A kernel
+                            # of these types selects its facet by POSITION in
+                            # its facet shape group, so to add them to the dict
+                            # below would give wrong answers on the triangular
+                            # facets of a prism, with no error.
+                            raise NotImplementedError(
+                                "Slate does not support facet integrals on prism "
+                                "cells (integral type %s)" % kinfo.integral_type)
                         if kinfo.active_domain_numbers._asdict()[{"exterior_facet": "exterior_facets",
                                                                   "exterior_facet_vert": "exterior_facets",
                                                                   "interior_facet": "interior_facets",
