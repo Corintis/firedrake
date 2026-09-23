@@ -2,7 +2,8 @@
 
 The meshes come from ``prism_meshes/`` at the repository root. They hold
 ``DM_POLYTOPE_TRI_PRISM`` cells, which is the only prism cell type that this
-code supports. Facet integrals (``ds``) are not part of these tests.
+code supports. Exterior facet integrals (``ds``) are tested at the end of the
+file. Interior facet integrals (``dS``) are not supported on a prism.
 
 Two gaps stopped a prism mesh above degree 1. Both are closed.
 
@@ -36,13 +37,14 @@ import numpy as np
 import pytest
 
 from firedrake import (CellDiameter, Constant, DirichletBC, ExtrudedMesh,
-                       Function, FunctionSpace, Mesh, PointNotInDomainError,
-                       PointEvaluator, SpatialCoordinate, TestFunction,
-                       TestFunctions, TrialFunction, TrialFunctions,
-                       UnitCubeMesh, UnitSquareMesh, VectorFunctionSpace,
+                       FacetNormal, Function, FunctionSpace, Mesh,
+                       PointNotInDomainError, PointEvaluator,
+                       SpatialCoordinate, TestFunction, TestFunctions,
+                       TrialFunction, TrialFunctions, UnitCubeMesh,
+                       UnitSquareMesh, VectorFunctionSpace,
                        VertexOnlyMeshMissingPointsError, VTKFile, as_vector,
-                       assemble, cos, div, dx, exp, grad, inner, pi, sin,
-                       solve)
+                       assemble, cos, dS, div, dot, ds, ds_b, ds_t, ds_v, dx,
+                       exp, grad, inner, pi, sin, solve)
 from firedrake.petsc import PETSc
 
 
@@ -1876,3 +1878,324 @@ def test_prism_point_evaluation_outside_the_mesh_fails(meshname):
     assert _at(u, outside, dont_raise=True) is None
     with pytest.raises(VertexOnlyMeshMissingPointsError):
         PointEvaluator(mesh, [outside]).evaluate(u)
+
+
+# ------------------------------------------------------ facet integrals, ds
+#
+# A prism has three quadrilateral facets and two triangular facets, and TSFC
+# compiles one kernel per facet shape. compile_form splits a plain ds into one
+# exterior_facet_quad and one exterior_facet_tri integral. The mesh gives each
+# kernel the facets of its shape inside the subdomain, and the local facet
+# number of each facet WITHIN its shape group. A correct total can hide two
+# errors that cancel, so the tests below measure each facet, or each marker,
+# separately.
+
+REFERENCE_MARKED_MESHNAME = "prism_reference_marked.msh"
+MIXED_MARKER_MESHNAME = "prism_slab_mixed_marker.msh"
+
+# The five facets of prism_reference_marked.msh, by physical group: the
+# area and the outward unit normal. See prism_meshes/make_prism_mesh.py.
+REFERENCE_FACETS = {
+    1: (0.5, (0.0, 0.0, -1.0)),
+    2: (0.5, (0.0, 0.0, 1.0)),
+    3: (1.0, (0.0, -1.0, 0.0)),
+    4: (1.0, (-1.0, 0.0, 0.0)),
+    5: (np.sqrt(2.0), (np.sqrt(0.5), np.sqrt(0.5), 0.0)),
+}
+REFERENCE_SURFACE_AREA = 3.0 + np.sqrt(2.0)
+
+# The area of each physical group of prism_slab.msh (1 bottom, 2 top,
+# 3 sides) and of prism_slab_mixed_marker.msh (2 top, 3 three sides, 4 bottom
+# and the side y = 0). The slab is the unit square times [0, 0.6].
+SLAB_HEIGHT = 0.6
+SLAB_MARKER_AREAS = {1: 1.0, 2: 1.0, 3: 4.0 * SLAB_HEIGHT}
+MIXED_MARKER_AREAS = {2: 1.0, 3: 3.0 * SLAB_HEIGHT, 4: 1.0 + SLAB_HEIGHT}
+SLAB_SURFACE_AREA = 2.0 + 4.0 * SLAB_HEIGHT
+
+
+def _ds_integral_types(form):
+    """The integral type of each kernel that compile_form makes for a form."""
+    from firedrake.tsfc_interface import compile_form
+
+    return sorted(k.kinfo.integral_type for k in compile_form(form, "form"))
+
+
+def _read_gmsh22_boundary_facets(path):
+    """Read the marked boundary facets of a gmsh 2.2 ASCII prism file.
+
+    :arg path: The path of the .msh file.
+    :returns: A list of pairs (marker, vector area). The vector area is the
+        integral of the outward unit normal over the facet.
+
+    This is independent of Firedrake. The integral of the normal over a
+    surface depends only on the boundary curve of the surface: it is half the
+    sum of the cross products of consecutive vertices. That holds for the
+    bilinear quadrilateral facets of a non-affine prism too. The sign comes
+    from the adjacent prism: the outward normal points away from its centroid.
+    """
+    coords, cells = _read_gmsh22_prisms(path)
+    lines = Path(path).read_text().split("\n")
+    tag_to_row = {}
+    i = lines.index("$Nodes")
+    for row in range(int(lines[i + 1])):
+        tag_to_row[int(lines[i + 2 + row].split()[0])] = row
+    cell_of_vertex_set = {}
+    for cell in cells:
+        for face in ((0, 1, 2), (3, 4, 5), (0, 1, 4, 3), (1, 2, 5, 4), (2, 0, 3, 5)):
+            cell_of_vertex_set[frozenset(cell[list(face)])] = cell
+    j = lines.index("$Elements")
+    facets = []
+    for row in range(int(lines[j + 1])):
+        fields = [int(x) for x in lines[j + 2 + row].split()]
+        # Type 2 is the 3-node triangle, type 3 the 4-node quadrilateral.
+        if fields[1] not in (2, 3):
+            continue
+        ntags = fields[2]
+        marker = fields[3]
+        vertices = [tag_to_row[t] for t in fields[3 + ntags:]]
+        points = coords[vertices]
+        area = 0.5 * sum(np.cross(points[k], points[(k + 1) % len(points)])
+                         for k in range(len(points)))
+        cell = cell_of_vertex_set[frozenset(vertices)]
+        outward = points.mean(axis=0) - coords[cell].mean(axis=0)
+        facets.append((marker, area if np.dot(area, outward) > 0 else -area))
+    return facets
+
+
+def test_prism_ds_compiles_to_one_kernel_per_facet_shape():
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    assert _ds_integral_types(Constant(1.0) * ds(domain=mesh)) == \
+        ["exterior_facet_quad", "exterior_facet_tri"]
+    assert _ds_integral_types(Constant(1.0) * ds(3, domain=mesh)) == \
+        ["exterior_facet_quad", "exterior_facet_tri"]
+
+
+@pytest.mark.parallel([1, 2, 3])
+def test_prism_ds_measures_each_facet_separately():
+    """The total surface area and the area of each of the five facets."""
+    mesh = Mesh(str(MESHDIR / REFERENCE_MARKED_MESHNAME))
+    total = assemble(Constant(1.0) * ds(domain=mesh))
+    assert np.isclose(total, REFERENCE_SURFACE_AREA, rtol=0, atol=1e-12)
+    for marker, (area, _) in REFERENCE_FACETS.items():
+        got = assemble(Constant(1.0) * ds(marker, domain=mesh))
+        assert np.isclose(got, area, rtol=0, atol=1e-12), f"facet {marker}"
+
+
+@pytest.mark.parallel([1, 2, 3])
+def test_prism_ds_integrates_a_coordinate_on_each_facet():
+    """The integral of x + 2 y + 4 z on each facet, from the facet centroid.
+
+    The integrand is linear, so its integral is the area times the value at
+    the centroid. Unlike a constant, it depends on WHERE each quadrature
+    point goes, so a kernel that maps the reference facet onto the wrong
+    physical facet fails here even when the areas are right.
+    """
+    mesh = Mesh(str(MESHDIR / REFERENCE_MARKED_MESHNAME))
+    x, y, z = SpatialCoordinate(mesh)
+    centroids = {1: (1 / 3, 1 / 3, 0.0), 2: (1 / 3, 1 / 3, 1.0),
+                 3: (0.5, 0.0, 0.5), 4: (0.0, 0.5, 0.5), 5: (0.5, 0.5, 0.5)}
+    for marker, (area, _) in REFERENCE_FACETS.items():
+        cx, cy, cz = centroids[marker]
+        got = assemble((x + 2 * y + 4 * z) * ds(marker, domain=mesh))
+        assert np.isclose(got, area * (cx + 2 * cy + 4 * cz), rtol=0, atol=1e-12), \
+            f"facet {marker}"
+
+
+@pytest.mark.parallel([1, 2, 3])
+def test_prism_ds_marker_composes_with_the_facet_shape():
+    """ds(marker) on a marker that holds one facet shape only."""
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    for marker, area in SLAB_MARKER_AREAS.items():
+        got = assemble(Constant(1.0) * ds(marker, domain=mesh))
+        assert np.isclose(got, area, rtol=0, atol=1e-12), f"marker {marker}"
+    total = assemble(Constant(1.0) * ds(domain=mesh))
+    by_marker = assemble(Constant(1.0) * (ds(1, domain=mesh) + ds(2, domain=mesh)
+                                          + ds(3, domain=mesh)))
+    assert np.isclose(total, SLAB_SURFACE_AREA, rtol=0, atol=1e-12)
+    assert np.isclose(by_marker, total, rtol=0, atol=1e-12)
+    two = assemble(Constant(1.0) * ds((1, 3), domain=mesh))
+    assert np.isclose(two, SLAB_MARKER_AREAS[1] + SLAB_MARKER_AREAS[3], rtol=0, atol=1e-12)
+
+
+@pytest.mark.parallel([1, 2, 3])
+def test_prism_ds_marker_that_holds_both_facet_shapes():
+    """Marker 4 holds the triangles of the bottom and the quadrilaterals of y = 0."""
+    mesh = Mesh(str(MESHDIR / MIXED_MARKER_MESHNAME))
+    form = Constant(1.0) * ds(4, domain=mesh)
+    assert _ds_integral_types(form) == ["exterior_facet_quad", "exterior_facet_tri"]
+    for marker, area in MIXED_MARKER_AREAS.items():
+        got = assemble(Constant(1.0) * ds(marker, domain=mesh))
+        assert np.isclose(got, area, rtol=0, atol=1e-12), f"marker {marker}"
+    x, y, z = SpatialCoordinate(mesh)
+    # The bottom contributes only through the triangles, and the side y = 0
+    # only through the quadrilaterals: int x over the bottom is 1/2, and
+    # int z over the side is H^2 / 2.
+    got = assemble((x + z) * ds(4, domain=mesh))
+    assert np.isclose(got, 0.5 + 0.5 * SLAB_HEIGHT**2 + 0.5 * SLAB_HEIGHT, rtol=0, atol=1e-12)
+
+
+@pytest.mark.parallel([1, 2, 3])
+def test_prism_ds_facet_subsets_hold_the_facets_of_one_shape():
+    """Each kernel iterates over the facets of its shape in the marker only.
+
+    The counts are summed over the processes. prism_slab_mixed_marker.msh has
+    26 triangles on the bottom and 6 quadrilaterals on the side y = 0 in marker
+    4, 26 triangles in marker 2, and 18 quadrilaterals in marker 3.
+    """
+    mesh = Mesh(str(MESHDIR / MIXED_MARKER_MESHNAME))
+    topology = mesh.topology
+    expected = {("exterior_facet_tri", 4): 26, ("exterior_facet_quad", 4): 6,
+                ("exterior_facet_tri", 2): 26, ("exterior_facet_quad", 2): 0,
+                ("exterior_facet_tri", 3): 0, ("exterior_facet_quad", 3): 18,
+                ("exterior_facet_tri", "everywhere"): 52,
+                ("exterior_facet_quad", "everywhere"): 24}
+    for (integral_type, marker), count in expected.items():
+        subset = topology.measure_set(integral_type, marker)
+        assert mesh.comm.allreduce(subset.size) == count, (integral_type, marker)
+
+
+def test_prism_ds_local_facet_number_is_the_position_in_the_shape_group():
+    """The kernel of a facet shape needs the position, not the FIAT number.
+
+    For the triangles the entity list is [3, 4], so FIAT facet 3 must reach the
+    kernel as 0 and FIAT facet 4 as 1. For the quadrilaterals the list is
+    [0, 1, 2] and the two numbers agree.
+    """
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    facets = mesh.topology.exterior_facets
+    fiat = facets.local_facet_dat.data_ro_with_halos.reshape(-1)
+    position = facets.shape_local_facet_dat.data_ro_with_halos.reshape(-1)
+    shape_indices, _ = facets._facet_shape_groups
+    triangles = shape_indices["exterior_facet_tri"]
+    quadrilaterals = shape_indices["exterior_facet_quad"]
+    assert len(triangles) == 52 and len(quadrilaterals) == 24
+    assert set(fiat[triangles]) == {3, 4}
+    assert np.array_equal(position[triangles], fiat[triangles] - 3)
+    assert set(fiat[quadrilaterals]) <= {0, 1, 2}
+    assert np.array_equal(position[quadrilaterals], fiat[quadrilaterals])
+
+
+@pytest.mark.parallel([1, 2, 3])
+def test_prism_ds_outward_normal_on_each_reference_facet():
+    """Each component of the integral of n over each facet, and n . n."""
+    mesh = Mesh(str(MESHDIR / REFERENCE_MARKED_MESHNAME))
+    n = FacetNormal(mesh)
+    assert np.isclose(assemble(dot(n, n) * ds(domain=mesh)), REFERENCE_SURFACE_AREA,
+                      rtol=0, atol=1e-12)
+    for marker, (area, normal) in REFERENCE_FACETS.items():
+        assert np.isclose(assemble(dot(n, n) * ds(marker, domain=mesh)), area,
+                          rtol=0, atol=1e-12), f"facet {marker}"
+        for i in range(3):
+            got = assemble(n[i] * ds(marker, domain=mesh))
+            assert np.isclose(got, area * normal[i], rtol=0, atol=1e-12), \
+                f"facet {marker} component {i}"
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("meshname", ["prism_slab.msh", "prism_warped.msh",
+                                      MIXED_MARKER_MESHNAME])
+def test_prism_ds_outward_normal_matches_the_gmsh_geometry(meshname):
+    """The integral of each component of n over each marker, from the gmsh file.
+
+    prism_warped.msh has no affine cell, a curved top, and tilted sides, so
+    every component of the normal is non-zero somewhere.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    n = FacetNormal(mesh)
+    expected = {}
+    for marker, area in _read_gmsh22_boundary_facets(MESHDIR / meshname):
+        expected[marker] = expected.get(marker, 0.0) + area
+    for marker, area in expected.items():
+        for i in range(3):
+            got = assemble(n[i] * ds(marker, domain=mesh))
+            assert np.isclose(got, area[i], rtol=0, atol=1e-12), \
+                f"marker {marker} component {i}"
+
+
+def _neumann_exact(mesh, degree):
+    x, y, z = SpatialCoordinate(mesh)
+    if degree == 1:
+        return 1.0 + x + 2.0 * y + 3.0 * z
+    return 1.0 + x + x**2 + 2.0 * y**2 + 3.0 * z**2 + x * y * z
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("degree", [1, 2, 3])
+@pytest.mark.parametrize("meshname,neumann,dirichlet",
+                         [("prism_slab.msh", (1, 3), 2),
+                          (MIXED_MARKER_MESHNAME, 4, (2, 3))])
+def test_prism_poisson_with_a_neumann_condition(meshname, neumann, dirichlet, degree):
+    """A manufactured solution in the FE space is reproduced exactly.
+
+    The Neumann boundary holds triangular facets and quadrilateral facets, so
+    both kernels of the ds contribute to the right hand side. A missing or
+    wrong contribution from either one moves the solution.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    V = FunctionSpace(mesh, "CG", degree)
+    exact = _neumann_exact(mesh, degree)
+    n = FacetNormal(mesh)
+    u = Function(V)
+    v = TestFunction(V)
+    F = (inner(grad(u), grad(v)) * dx - inner(-div(grad(exact)), v) * dx
+         - inner(dot(grad(exact), n), v) * ds(neumann, domain=mesh))
+    bc = DirichletBC(V, exact, dirichlet)
+    solve(F == 0, u, bcs=bc, solver_parameters={"ksp_type": "preonly", "pc_type": "lu"})
+    error = float(np.sqrt(abs(assemble(inner(u - exact, u - exact) * dx))))
+    assert error < 1e-10
+
+
+def test_prism_ds_matrix_rows_match_a_vector_assembly():
+    """A boundary mass matrix times one equals the assembled ds of the test function."""
+    mesh = Mesh(str(MESHDIR / "prism_warped.msh"))
+    V = FunctionSpace(mesh, "CG", 2)
+    u, v = TrialFunction(V), TestFunction(V)
+    A = assemble(inner(u, v) * ds(domain=mesh))
+    b = assemble(inner(Constant(1.0), v) * ds(domain=mesh))
+    ones, Ax = A.petscmat.createVecs()
+    ones.set(1.0)
+    A.petscmat.mult(ones, Ax)
+    with b.dat.vec_ro as bvec:
+        assert np.allclose(Ax.array_r, bvec.array_r, rtol=0, atol=1e-13)
+    assert np.isclose(Ax.sum(), assemble(Constant(1.0) * ds(domain=mesh)), rtol=0, atol=1e-12)
+
+
+def test_prism_interior_facet_integral_is_rejected():
+    """dS on a prism is out of scope, and fails with a message, not a number."""
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    with pytest.raises(ValueError, match="more than one shape"):
+        assemble(Constant(1.0) * dS(domain=mesh))
+
+
+# The regression guard: a mesh whose facets all have one shape keeps ONE kernel
+# for one ds, with the old integral type, and the same values. The values are
+# exact: the surface area, and the divergence theorem for x . n.
+NON_PRISM_MESHES = {
+    "triangle": (lambda: UnitSquareMesh(3, 4), 4.0, 2.0),
+    "quadrilateral": (lambda: UnitSquareMesh(3, 4, quadrilateral=True), 4.0, 2.0),
+    "tetrahedron": (lambda: UnitCubeMesh(2, 2, 3), 6.0, 3.0),
+    "hexahedron": (lambda: UnitCubeMesh(2, 2, 3, hexahedral=True), 6.0, 3.0),
+}
+
+
+@pytest.mark.parametrize("cellname", sorted(NON_PRISM_MESHES))
+def test_non_prism_ds_still_compiles_to_one_kernel(cellname):
+    make_mesh, area, x_dot_n = NON_PRISM_MESHES[cellname]
+    mesh = make_mesh()
+    x = SpatialCoordinate(mesh)
+    n = FacetNormal(mesh)
+    assert _ds_integral_types(Constant(1.0) * ds(domain=mesh)) == ["exterior_facet"]
+    assert _ds_integral_types(Constant(1.0) * ds(1, domain=mesh)) == ["exterior_facet"]
+    assert np.isclose(assemble(Constant(1.0) * ds(domain=mesh)), area, rtol=0, atol=1e-12)
+    assert np.isclose(assemble(dot(x, n) * ds(domain=mesh)), x_dot_n, rtol=0, atol=1e-12)
+    assert np.isclose(assemble(Constant(1.0) * ds(1, domain=mesh)), 1.0, rtol=0, atol=1e-12)
+
+
+def test_extruded_ds_still_compiles_to_one_kernel_per_measure():
+    mesh = ExtrudedMesh(UnitSquareMesh(2, 3), 3)
+    for measure, integral_type, area in ((ds_v, "exterior_facet_vert", 4.0),
+                                         (ds_t, "exterior_facet_top", 1.0),
+                                         (ds_b, "exterior_facet_bottom", 1.0)):
+        form = Constant(1.0) * measure(domain=mesh)
+        assert _ds_integral_types(form) == [integral_type]
+        assert np.isclose(assemble(form), area, rtol=0, atol=1e-12)

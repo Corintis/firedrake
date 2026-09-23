@@ -17,6 +17,7 @@ from tsfc import compile_form as original_tsfc_compile_form
 from tsfc.parameters import PARAMETERS as tsfc_default_parameters
 from tsfc.ufl_utils import extract_firedrake_constants
 from tsfc.kernel_interface.firedrake_loopy import ActiveDomainNumbers
+from tsfc.kernel_interface.common import shape_facet_types
 
 from pyop2 import op2
 from pyop2.caching import memory_and_disk_cache, default_parallel_hashkey
@@ -218,6 +219,8 @@ def compile_form(form, name, parameters=None, split=True, dont_split=(), diagona
         parameters = default_parameters["form_compiler"].copy()
         parameters.update(_)
 
+    form = _split_facet_integrals_by_shape(form)
+
     kernels = []
     numbering = form.terminal_numbering()
     all_meshes = extract_domains(form)
@@ -263,6 +266,29 @@ def compile_form(form, name, parameters=None, split=True, dont_split=(), diagona
 
     kernels = tuple(kernels)
     return kernels
+
+
+def _split_facet_integrals_by_shape(form):
+    """Split each exterior facet integral on a cell with more than one facet shape.
+
+    A prism has quadrilateral and triangular facets. TSFC compiles one kernel
+    per facet shape, so replace each ``exterior_facet`` integral on such a cell
+    with one integral of each type in ``shape_facet_types``. The integrals keep
+    their subdomain id; the mesh intersects the subdomain with the facet shape.
+    Integrals on every other cell are returned unchanged.
+    """
+    integrals = []
+    for integral in form.integrals():
+        cell = integral.ufl_domain().ufl_cell()
+        if (integral.integral_type() == "exterior_facet"
+                and isinstance(cell, ufl.Cell) and len(cell.facet_types) > 1):
+            integrals.extend(integral.reconstruct(integral_type=integral_type)
+                             for integral_type in sorted(shape_facet_types))
+        else:
+            integrals.append(integral)
+    if len(integrals) == len(form.integrals()):
+        return form
+    return Form(integrals)
 
 
 def _real_mangle(form):

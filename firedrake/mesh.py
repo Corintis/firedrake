@@ -54,6 +54,7 @@ except ImportError:
 # Only for docstring
 import mpi4py  # noqa: F401
 from finat.element_factory import as_fiat_cell
+from tsfc.kernel_interface.common import lower_integral_type, shape_facet_types
 
 
 if typing.TYPE_CHECKING:
@@ -272,6 +273,9 @@ class _Facets(object):
                              "interior_facet_horiz"):
             # these iterate over the base cell set
             return self.mesh.cell_subset(subdomain_id, all_integer_subdomain_ids)
+        elif integral_type in shape_facet_types:
+            return self._shape_subset(integral_type, subdomain_id,
+                                      all_integer_subdomain_ids)
         elif not (integral_type.startswith("exterior_")
                   or integral_type.startswith("interior_")):
             raise ValueError("Don't know how to construct measure for '%s'" % integral_type)
@@ -331,6 +335,87 @@ class _Facets(object):
                                    "Did you choose the right label?")
 
             return self._subsets.setdefault(markers, op2.Subset(self.set, indices))
+
+    def _shape_subset(self, integral_type, subdomain_id, all_integer_subdomain_ids):
+        """Return the facets of one facet shape in the given subdomain.
+
+        The result is the intersection of the subdomain subset of an
+        ``exterior_facet`` integral and the facets whose shape the integral
+        type selects. A marker can hold facets of both shapes, so each of the
+        two kernels of a ``ds`` must intersect it with its own shape.
+        """
+        key = (integral_type, subdomain_id, all_integer_subdomain_ids)
+        try:
+            return self._subsets[key]
+        except KeyError:
+            marked = self.measure_set("exterior_facet", subdomain_id,
+                                      all_integer_subdomain_ids)
+            if isinstance(marked, op2.Subset):
+                marked_indices = marked.indices
+            else:
+                marked_indices = np.arange(marked.total_size, dtype=IntType)
+            shape_indices, _ = self._facet_shape_groups
+            indices = np.intersect1d(marked_indices, shape_indices[integral_type])
+            return self._subsets.setdefault(key, op2.Subset(self.set, indices))
+
+    @cached_property
+    def _facet_shape_groups(self):
+        """Group the facets by facet shape.
+
+        Returns a pair. The first item is a dict from each integral type in
+        ``shape_facet_types`` to the sorted indices, into the facet set, of the
+        facets of that shape. The shape comes from the DMPlex cell type of the
+        facet. The second item is the local facet number of each facet within
+        its shape group. Only a cell whose facets have more than one shape (a
+        prism) has these integral types.
+
+        A kernel of type ``exterior_facet_tri`` or ``exterior_facet_quad``
+        selects its facet BY POSITION in the entity list that
+        ``lower_integral_type`` gives for that type, not by the FIAT facet
+        number. For a prism the lists are ``[0, 1, 2]`` (quadrilaterals) and
+        ``[3, 4]`` (triangles), so FIAT facet 3 is position 0 and FIAT facet 4
+        is position 1. A FIAT number passed instead makes the kernel read past
+        the end of its tables, with no error.
+        """
+        if self.kind != "exterior":
+            raise NotImplementedError("Facet shape groups are only available for exterior facets")
+        fiat_cell = as_fiat_cell(self.mesh.ufl_cell())
+        facet_dim = fiat_cell.get_dimension() - 1
+        plex = self.mesh.topology_dm
+        local_facets = self.local_facet_dat.data_ro_with_halos.reshape(-1)
+        positions = np.full(len(self.facets), -1, dtype=np.intc)
+        shape_indices = {}
+        for integral_type in sorted(shape_facet_types):
+            _, entity_ids = lower_integral_type(fiat_cell, integral_type)
+            nvertices = len(fiat_cell.construct_subelement(facet_dim, entity=entity_ids[0]).get_vertices())
+            polytope = _sub_entity_polytope_types[(facet_dim, nvertices)]
+            if plex.getStratumSize("celltype", polytope):
+                points = plex.getStratumIS("celltype", polytope).indices
+            else:
+                points = np.empty(0, dtype=IntType)
+            indices = np.flatnonzero(np.isin(self.facets, points)).astype(IntType)
+            if not np.isin(local_facets[indices], entity_ids).all():
+                raise RuntimeError(
+                    f"The FIAT facet numbers of the {integral_type} facets are not "
+                    f"all in {entity_ids}; the cell closure does not match the facet shapes")
+            position = np.full(len(fiat_cell.get_topology()[facet_dim]), -1, dtype=np.intc)
+            position[entity_ids] = np.arange(len(entity_ids), dtype=np.intc)
+            positions[indices] = position[local_facets[indices]]
+            shape_indices[integral_type] = indices
+        if (positions < 0).any():
+            raise RuntimeError("Some exterior facets have no facet shape group")
+        return shape_indices, positions
+
+    @cached_property
+    def shape_local_facet_dat(self):
+        """Dat of the local facet number of each facet within its facet shape group.
+
+        Pass this, not :attr:`local_facet_dat`, to a kernel of an integral type
+        in ``shape_facet_types``. See :attr:`_facet_shape_groups`.
+        """
+        _, positions = self._facet_shape_groups
+        return op2.Dat(self.local_facet_dat.dataset, positions, np.uintc,
+                       "%s_%s_shape_local_facet_number" % (self.mesh.name, self.kind))
 
     def _collect_unmarked_points(self, markers):
         """Collect points that are not marked by markers."""
@@ -1052,7 +1137,8 @@ class AbstractMeshTopology(object, metaclass=abc.ABCMeta):
         if integral_type == "cell":
             return self.cell_subset(subdomain_id, all_integer_subdomain_ids)
         elif integral_type in ("exterior_facet", "exterior_facet_vert",
-                               "exterior_facet_top", "exterior_facet_bottom"):
+                               "exterior_facet_top", "exterior_facet_bottom",
+                               *shape_facet_types):
             return self.exterior_facets.measure_set(integral_type, subdomain_id,
                                                     all_integer_subdomain_ids)
         elif integral_type in ("interior_facet", "interior_facet_vert",

@@ -12,6 +12,7 @@ import firedrake
 import numpy
 from pyadjoint.tape import annotate_tape
 from tsfc import kernel_args
+from tsfc.kernel_interface.common import shape_facet_types
 from finat.element_factory import create_element
 from tsfc.ufl_utils import extract_firedrake_constants
 import ufl
@@ -1471,6 +1472,8 @@ class ExplicitMatrixAssembler(ParloopFormAssembler):
          "interior_facet_horiz": op2.ON_INTERIOR_FACETS,
          "exterior_facet": op2.ALL,
          "exterior_facet_vert": op2.ALL,
+         "exterior_facet_tri": op2.ALL,
+         "exterior_facet_quad": op2.ALL,
          "interior_facet": op2.ALL,
          "interior_facet_vert": op2.ALL}
 
@@ -1747,7 +1750,10 @@ class _GlobalKernelBuilder:
         if not all(sd is None for sd in subdomain_data.get(self._integral_type, [None])):
             return True
 
-        if self._subdomain_id == "everywhere":
+        if self._integral_type in shape_facet_types:
+            # These iterate over the facets of one shape only.
+            return True
+        elif self._subdomain_id == "everywhere":
             return False
         elif self._subdomain_id == "otherwise":
             return self._all_integer_subdomain_ids.get(self._kinfo.integral_type, None) is not None
@@ -2246,6 +2252,9 @@ def _as_parloop_arg_exterior_facet(_, self):
     else:
         m, integral_type = mesh.topology.trans_mesh_entity_map(self._mesh.topology, self._integral_type, self._subdomain_id, self._all_integer_subdomain_ids)
         assert integral_type == "exterior_facet"
+    if self._integral_type in shape_facet_types:
+        # The kernel selects the facet by its position within its shape group.
+        return op2.DatParloopArg(mesh.exterior_facets.shape_local_facet_dat, m)
     return op2.DatParloopArg(mesh.exterior_facets.local_facet_dat, m)
 
 
