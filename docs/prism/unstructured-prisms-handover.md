@@ -9,6 +9,12 @@ That file is NOT in the repository. It is a local, untracked file. The correctio
 This document records what was built, what the design document got wrong, and the
 things that cost the most time. It is written for whoever picks this up next.
 
+Phase C (interior facet integrals, `dS`) has its own plan,
+`phaseC_interior_facets_plan.md`. That file is also local and untracked. Section 8
+of this document and section 7 of `plan-corrections.md` are complete without it.
+The Phase C commits are `6873b3278..a3e55ab08` here and `08064fb5..a6979469` in
+`../fiat`.
+
 ---
 
 ## 1. What works
@@ -31,12 +37,21 @@ prism may point in its own direction — loads, assembles and solves.
 | Checkpoint save and load | works |
 | MATIS assembly (`mat_type="is"`) of a mixed space | **broken, pre-existing, not prism-specific** — see below |
 | Exterior facet integrals (`ds`), with markers, "otherwise", Robin and Neumann conditions | works, at 1, 2 and 3 ranks (Phase B) |
-| `ds` with a `QuadratureRule` object in the metadata or the form compiler parameters | `NotImplementedError` from `_split_facet_integrals_by_shape`; use `quadrature_degree` or a scheme name |
-| `ds(subdomain_data=...)` | the same `NotImplementedError` as on the other meshes |
-| Slate facet integrals | `NotImplementedError`, which names prisms (Slate `kernel_builder.py`) |
-| `PatchPC` with `ds` | `NotImplementedError("Only for cell, interior facet, or exterior facet integrals")`, inside a PETSc error |
-| A `ds` over more than one mesh (`intersect_measures`) | `ValueError` from TSFC `lower_integral_type` |
-| Interior facet integrals (`dS`) | `NotImplementedError`, which names prisms; Phase C adds them (see `phaseC_interior_facets_plan.md`) |
+| Interior facet integrals (`dS`, `dS(tag)`, `dS((a, b))`, and `dS + dS(tag)`, which gives an "otherwise" kernel) | works in serial and at 2 and 3 ranks (Phase C, section 8). A marker can hold triangles, quadrilaterals or both |
+| `jump`, `avg`, `FacetNormal('±')`, `CellVolume('±')`, `CellDiameter('±')`, `FacetArea` in a `dS` integrand | works |
+| DG methods on `dS`, for example SIPG | works; DG1-3 converge at the theoretical order on non-affine, scrambled meshes |
+| Weak interface conditions on `dS(tag)`: a surface source, a contact conductance | works; exact on each facet shape |
+| `dS` on a facet submesh, `Submesh(mesh, 2, tag)` (its interior edges) | works (C7). Before C7 it gave a wrong answer with no error |
+| An integral over a prism mesh and its facet submesh: `dS(tag)` or `ds(tag)` on the prism mesh with `dx` on the submesh, in either direction (C8) | works in serial; a Lagrange multiplier on an interior surface gives the exact solution |
+| The same C7 and C8 tests in parallel | **pending** |
+| `ds` or `dS` with a `QuadratureRule` object in the metadata or the form compiler parameters | `NotImplementedError` from `_split_facet_integrals_by_shape`; use `quadrature_degree` or a scheme name. A C8 coupling that keeps one facet shape accepts the object |
+| `dS` with a triangle rule that has no point permutation (`"quadrature_rule": "canonical"` at degree 2 or more, or the default rule above degree 50) | `NotImplementedError` from `set_quad_rule`, which names the integral type, the scheme and the degree |
+| `ds(subdomain_data=...)`, `dS(subdomain_data=...)` | the same `NotImplementedError` as on the other meshes |
+| Slate facet integrals (`ds` and `dS`) | `NotImplementedError`, which names prisms, the integral type and the measure (Slate `kernel_builder.py`) |
+| `PatchPC` with `ds` or `dS` | `NotImplementedError("Only for cell, interior facet, or exterior facet integrals")`, inside a PETSc error |
+| `MinFacetEdgeLength` on a prism | `Exception: Cell type prism not supported.` (not a Phase C change; no test) |
+| A facet integral on a prism mesh coupled with `dx` of a prism submesh (codim 0) | `NotImplementedError` ("more than one shape"). Integrate on the submesh instead (section 8.3) |
+| A cross-mesh measure on the parent with no tag | **a wrong answer with no error**, pre-existing on all cells (section 8.3) |
 | H(div)/H(curl) on prisms, mixed tet/prism meshes | out of scope |
 
 **Read the mixed-space row as qualified, because it is.** Prism mixed spaces
@@ -115,11 +130,14 @@ Test meshes, all tracked in `tests/firedrake/meshes/prism/`:
 | `prism_warped.msh` | 52 cells, non-affine, axes tilt | non-affine geometry |
 | `prism_two_perpendicular.msh` | 2 cells whose axes are perpendicular | **the counterexample that disproved the first orientation fix** |
 | `prism_order_r0/r1/r2.msh` | 64, 512, 4096 cells, non-affine, each level halves the element size | the convergence order test; a Delaunay base at half the target size does not halve the element size, so these use a transfinite base |
+| `prism_interior_marked.msh` | the box `[-0.5, 0.5]^2 x [0, 1]`; marker 10 = the plane `z = 0.5` (136 triangles), marker 20 = the plane `x = 0` (42 quadrilaterals), marker 30 = markers 10 and 20 | the `dS` tests (Phase C) and the submesh tests (C7, C8) |
+| `prism_interior_marked_scrambled.msh`, `prism_warped_scrambled.msh`, `prism_order_r0/r1/r2_scrambled.msh` | the same geometry as the source mesh; each prism's node list is changed by one of the 6 orientation-preserving prism symmetries | **the only meshes that show a missing triangle point permutation** (section 8.4) |
 
 The repository ignores `*.msh`. These files are tracked with `git add -f`, as are
 the other meshes in `tests/firedrake/meshes/`. `make_prism_mesh.py` in the same
 directory writes all of them. It writes the two `prism_reference*.msh` files from
-hand-written text, and the others through gmsh. A missing mesh makes the prism tests
+hand-written text, and the others through gmsh. `scramble` writes the scrambled
+copies, with the fixed seeds in `SCRAMBLED`. A missing mesh makes the prism tests
 fail, not skip.
 
 ---
@@ -185,6 +203,7 @@ load-bearing errors:
    (the "Phase C" of the design document) is cancelled, not deferred. The name
    "Phase C" now means other work: interior facet integrals (`dS`) on prisms,
    which the user needs. `phaseC_interior_facets_plan.md` gives that plan.
+   Section 8 records what Phase C did.
 3. **Section 4 omits the numbering layer entirely** (see 2.1).
 4. **Section 12.5's Phase A exit criterion is unusable.** `prism_smoke_test.py` could
    not gate this work: stage 4 needed Phase B, and stage 6 is structurally blind to
@@ -347,7 +366,7 @@ submesh       387 passed, 0 failed
 ```
 
 The output, multigrid, slate and regression suites were not run. One full run
-after Phase C replaces these numbers. The earlier counts (17 regression failures at
+after Phase C replaces these numbers. That run is **pending**. The earlier counts (17 regression failures at
 the base, 15 on the branch) come from before Tasks 7 to 9 and are not current.
 
 ---
@@ -392,3 +411,291 @@ implementation deliberately and confirm the test fails.** It costs one rebuild a
 it is the only thing that distinguishes a test from a ritual. One hexahedron control
 added this way caught a bug in its own test rather than in the code — which is also
 the argument for keeping controls on cell types the change should not affect.
+
+---
+
+## 8. Phase C: interior facet integrals (`dS`)
+
+Phase C makes `dS` work on an unstructured prism mesh. The user writes one `dS`,
+as on any other mesh. The user needs it for weak conditions on interior surfaces
+and for DG methods.
+
+Commits here: `67916c527` (TSFC), `f3a11f158` (Firedrake), `25d030000` (the Slate
+message), `bd4780c6a` and `b52574371` (meshes and tests), `4fc173324` (C7),
+`8b6155581` (the partition-boundary test), `a3e55ab08` (C8). Commits in `../fiat`:
+`0029f52a` (the triangle map), `cc839a77` (its fix), `a6979469` (a regression test).
+
+### 8.1 How the two sides of a facet agree
+
+A `dS` kernel maps the facet quadrature points to physical space from each of the
+two cells. The two lists of points must be in the same order. Firedrake gets this
+in three ways:
+
+| Cell | Method |
+|---|---|
+| Simplex | `dmcommon.closure_ordering` sorts the vertices by global number, so both cells list a shared facet in one order |
+| Quadrilateral (2D) | `dmcommon.quadrilateral_closure_ordering` orients the cells (Homolya-McRae), so each shared edge has one direction |
+| Hexahedron | the closure keeps the PETSc cone order; each side reads its facet orientation from `local_facet_orientation_dat` and permutes its points into the canonical order |
+
+`MeshTopology.cell_closure` sends a prism to `dmcommon.create_cell_closure`, as a
+hexahedron. So a prism uses the hexahedron method on both facet shapes. The
+prototype measured the naive order (point `k` against point `k`): it fails on 42
+of the 66 interior quadrilaterals of `prism_slab.msh`, and on 83 % of the
+triangles of a scrambled mesh.
+
+### 8.2 The design
+
+**Two interior shape types.** `interior_facet_tri` (FIAT facets `[3, 4]`, measure
+name `dS_tri`) and `interior_facet_quad` (FIAT facets `[0, 1, 2]`, `dS_quad`).
+`_split_facet_integrals_by_shape` (`firedrake/tsfc_interface.py`) replaces each
+prism `dS` with one integral of each type. Each integral keeps its subdomain id.
+`_Facets._shape_subset` (`firedrake/mesh.py`) intersects the marker subset with
+the facets of the shape. Both names start with `"interior_facet"`, so the many
+`startswith("interior_facet")` tests in UFL and TSFC need no change. A plain
+`interior_facet` integral on a prism still raises `NotImplementedError` in
+`lower_integral_type`. Only a direct TSFC caller can send one.
+
+**A separate dict.** The two types are in `interior_shape_facet_types`, in
+`tsfc/kernel_interface/common.py`, beside `shape_facet_types`. The same module
+registers them with `ufl.measure.register_integral_type` and gives them the value
+`"+"` in `ufl.algorithms.apply_restrictions.default_restriction_map`. A missing
+key there is a bare `KeyError`.
+
+**Warning.** Do not add the interior types to `shape_facet_types`. The exterior
+facet paths read that dict: `exterior_facet_types` in `firedrake_loopy.py`,
+`_as_parloop_arg_exterior_facet` and `MeshTopology.measure_set`. The mutation
+makes 54 of 73 test cases fail, but a change that is only a little different can
+give wrong answers with no error.
+
+**The position contract (rank 2).** This is the point where Phase C can fail with
+no error:
+
+| Data | Indexed by | Holds |
+|---|---|---|
+| `_Facets.shape_local_facet_dat` | facet, side | the POSITION of the FIAT facet in the entity list of `lower_integral_type` for its shape. The `dS` kernel selects its tables by position |
+| `_Facets.local_facet_dat` | facet, side | the FIAT facet number. Unchanged |
+| `_Facets.local_facet_orientation_dat` | facet, side | the orientation of the FIAT facet in that cell. Unchanged; the kernel uses it directly |
+
+`_Facets._facet_shape_groups` computes the positions for both kinds of facets.
+The array has the shape `(nfacets, 1)` for exterior facets and `(nfacets, 2)` for
+interior facets. A side whose cell is absent (`facet_cell == -1`, an outer halo
+facet) gets position 0 with no check, because no iteration set holds that facet.
+FIAT facets 3 and 4 are positions 0 and 1. The quadrilateral positions are equal
+to their FIAT numbers. So a FIAT number in place of the position ("trap A" of
+Phase B) is wrong on the triangles only.
+
+**The canonical point order, on the prism interior types only.**
+`ContextBase.use_canonical_quadrature_point_ordering` (`tsfc/fem.py`) returns
+`True` for the two interior shape types on a `UFCPrism`. It stays off for the
+exterior shape types of one mesh, because a `ds` kernel reads one side only. So
+the Phase B prism `ds` kernels are byte-identical. C8 adds one case: an exterior
+shape type on a prism in a kernel with more than one domain (see the C8 map
+changes below).
+
+**The lazy FInAT triangle map.** The permutation needs a point map for each facet
+orientation. A Gauss-Legendre line rule has one. A triangle rule does not: its
+stored map is `(None,)`. In `../fiat/finat/quadrature.py`,
+`AbstractQuadratureRule.intrinsic_orientation_permutation_map_tuple` is now a
+`cached_property`. For a triangle rule with the stored map `(None,)`, it calls
+`_triangle_intrinsic_orientation_permutation_map`. Row `o` of the map uses entry
+`o` of `sorted(itertools.permutations(range(3)))` on the barycentric coordinates
+of the points. This is the convention of
+`FIAT.orientation_utils.make_entity_permutations_simplex`, and a FInAT test checks
+it against that function. The map checks the points AND the weights (tolerance
+1e-12), and raises `ValueError` if the rule is not symmetric.
+
+The map is lazy because of the cache keys. `QuadratureRule.__repr__` includes the
+stored map, and the repr is the hash and the cache key of the rule. A map that the
+constructor stores changes the key of every triangle and tetrahedron facet rule in
+every Firedrake form. A lazy property changes nothing for a kernel that does not
+ask for it. Measured: the repr and the hash of 144 triangle and tetrahedron rules
+do not change, and the generated code of the non-prism kernels is byte-identical.
+
+When a triangle rule has no map, `set_quad_rule`
+(`tsfc/kernel_interface/common.py`) raises `NotImplementedError`, which names the
+integral type, the scheme and the degree. `_make_quad_multiindex_permuted`
+(`tsfc/fem.py`) catches the `ValueError` too, as a second guard for a direct
+caller. Without the error, the naive order gives a wrong answer with no error.
+
+**The C7 closure rule.** `MeshTopology.cell_closure`: a codim-1 submesh of a prism
+mesh does not inherit the closure of its parent. The prism closure keeps the cone
+order, so the two cells of a submesh facet saw the points in different orders.
+Triangle cells now take `dmcommon.closure_ordering` and quadrilateral cells take
+`dmcommon.quadrilateral_closure_ordering`. A codim-0 submesh still inherits.
+Measured: `|x('+') - x('-')|**2 * dS` on `Submesh(mesh, 2, 10)` fell from 8.4e-2 to
+3.8e-32. The interpolation between the parent and the submesh is exact in both
+directions, before and after the change.
+
+**The C8 map changes.** C8 couples the facets of a prism mesh with the cells of a
+facet submesh:
+
+1. `_split_facet_integrals_by_shape` also reads `extra_domain_integral_type_map`.
+   The cells of a triangle or a quadrilateral submesh fix the facet shape, so the
+   split keeps one shape type, and gives it to each prism domain of the integral.
+   A coupling with another integral type, for example a prism `ds` with `dx` of a
+   prism submesh, raises `NotImplementedError`.
+2. `MeshTopology.submesh_map_child_parent` and `trans_mesh_entity_map`
+   (`firedrake/mesh.py`) accept the shape types. A facet type on a prism target
+   becomes the shape type of the source facets, or of the submesh cells. If no
+   rank holds a facet of the shape in the subdomain, the map uses the facets of
+   the same kind, because the kernel then iterates over an empty set.
+3. `_as_parloop_arg_exterior_facet` and `_as_parloop_arg_interior_facet`
+   (`firedrake/assemble.py`) take the integral type of the other mesh from
+   `trans_mesh_entity_map`. On a prism mesh they pass `shape_local_facet_dat`.
+4. `use_canonical_quadrature_point_ordering` is on for an exterior shape type of
+   a prism when the kernel has more than one domain. The submesh cell permutes its
+   points by its own orientation, with the triangle map above.
+
+Measured: the generated code of 17 kernels (non-prism cross-mesh kernels, and
+prism `ds`, `dS` and `dx` on one mesh) is byte-identical before and after C8.
+
+### 8.3 The limits
+
+Each limit is an explicit error, except the last one.
+
+- **Slate** with a `ds` or `dS` on a prism: `NotImplementedError` from
+  `firedrake/slate/slac/kernel_builder.py`. The message names prisms, the integral
+  type and the measure. Slate gives the kernel the FIAT facet number of its own
+  loop, so the shape types in Slate would give wrong answers on the triangles.
+- **PatchPC** with a `ds` or `dS` on a prism:
+  `NotImplementedError("Only for cell, interior facet, or exterior facet integrals")`
+  from `firedrake/preconditioners/patch.py`, inside a `PETSc.Error`.
+- **A `QuadratureRule` object** in the metadata or the parameters of a prism `ds`
+  or `dS`: `NotImplementedError` from `_split_facet_integrals_by_shape`. A rule is
+  for one facet shape only. Use `quadrature_degree` or a scheme name. A C8
+  coupling that keeps one shape accepts the object.
+- **A triangle rule that is not symmetric**: the metadata key
+  `"quadrature_rule": "canonical"` at degree 2 or more, or the default rule above
+  degree 50 (collapsed Gauss). `NotImplementedError`, as in section 8.2. The
+  default rule is symmetric at degrees 0 to 50, `"KMV"` at degrees 1 to 6.
+  **Caution:** the key is `"quadrature_rule"`. A `"scheme"` key has no effect: the
+  default rule is used with no error.
+- **`MinFacetEdgeLength`** on a prism: `Exception: Cell type prism not supported.`
+  Phase C did not change it, and no test covers it.
+- **`dS(subdomain_data=...)`**: the same `NotImplementedError` as on other meshes.
+  `_subdomain_data_integral_type` (`firedrake/assemble.py`) maps the shape types
+  back to `"interior_facet"`. Without that map the data is ignored with no error.
+- **A prism facet integral coupled with `dx` of a codim-0 prism submesh**:
+  `NotImplementedError` ("more than one shape"). Integrate on the submesh
+  instead, for example
+  `Measure("ds", sub, intersect_measures=(Measure("ds", mesh),))`.
+- **MATIS mixed assembly**: broken, pre-existing, on all cells (section 1).
+- **An untagged cross-mesh measure on the parent: a silent wrong answer.**
+  `dS(parent, intersect_measures=(dx(sub),))` with no tag reads the map value -1
+  for each parent facet that the submesh does not have. On a tetrahedron mesh it
+  gave 7.99 and 11.49 in two runs of the same form. On a prism codim-0 case it
+  gave a bus error. This defect is pre-existing and is on all cells. **Always give
+  the measure on the parent the tag of the submesh**, for example `dS(10)`.
+
+A marker that holds one facet shape still runs the kernel of the other shape over
+an empty subset. The result is correct. Phase B accepts the same small cost.
+
+### 8.4 Lessons for the tests (plan 7.4)
+
+The prototype had four mutation switches. Each one removes one part of the design.
+The test tables of `.superpowers/sdd/phaseC-tests-report.md` record which tests
+each mutation fails. These are the lessons:
+
+1. **An aligned mesh hides the triangle permutation.** In each measured gmsh mesh
+   whose prism axes are along `z`, both sides of every triangle give `o = 2`, so
+   the naive order is correct by chance. With the triangle permutation removed, every
+   check on `prism_interior_marked.msh` passes. The scrambled meshes are the only
+   meshes that show the defect. `test_prism_dS_scrambled_mesh_presents_every_orientation`
+   asserts that the `'-'` sides of a scrambled mesh have all 6 triangle
+   orientations and all 4 quadrilateral `io` values. Without it, a change in the
+   gmsh reader could align the meshes again, and each orientation test would pass
+   with no permutation. This is the lesson of section 4 again.
+2. **A value that is constant along a facet cannot find a point order error.**
+   Areas, the normals of flat facets, `FacetArea` and DG0 data do not change when
+   the points change order.
+3. **A form that reads one side only cannot find it either.** A surface source
+   `v('+') * dS(tag)` permutes the points and the weights of one side together.
+   Only a product of a `'+'` value and a `'-'` value finds a mismatch.
+4. **A field that is constant along the facets of one shape hides that shape.**
+   The first contact conductance test used `u = u(z)` on marker 10, and each
+   triangle of that marker is a plane `z = const`. It passed with no triangle
+   permutation. `test_prism_dS_contact_conductance_is_exact` now adds a linear
+   term that changes along the plane.
+5. **Use `|x('+') - x('-')|**2 * dS` on a scrambled mesh.** It finds every
+   orientation mutation, for one assembly. It does not find trap A, because a
+   wrong FIAT facet selects the same wrong facet on both sides. The area test
+   (`test_prism_dS_measures_each_marked_surface`) finds trap A.
+6. **Make every parallel test symmetric in `'+'` and `'-'`.** The `'+'` cell of a
+   partition-boundary facet can change with the number of ranks. Use `jump`,
+   `avg` or `|x('+') - x('-')|**2`, not a bare `u('+')` against a fixed number.
+7. **The default partitioner puts almost no triangle on a partition boundary.** At
+   2 and 3 ranks it gave 0 to 2 such triangles. So the 12 parallel `dS` tests did
+   not see a triangle whose two cells are on different ranks.
+   `test_prism_dS_on_a_partition_boundary` (`parallel([2, 3])`) uses a shell
+   partition that cuts along the marked planes. Its guard asserts the counts: all
+   136 triangles of marker 10 on the partition boundary, and 21 quadrilaterals of
+   marker 20 at 3 ranks (0 at 2 ranks). So a change of the partition cannot make
+   the test pass with no shared facet. The test does its collectives before its
+   first assert.
+8. **Some tests cost too much for the suite.** The SIPG DG3 solve on
+   `prism_order_r2_scrambled.msh` took 454 s and 10 GB. So
+   `test_prism_dS_sipg_converges_at_the_expected_order` uses `r0` and `r1` only at
+   degree 3. Degrees 1 and 2 use all three meshes. The test is serial only.
+9. **Test a shared property through each caller.** `0029f52a` broke every
+   hexahedron facet kernel and every prism `interior_facet_quad` kernel, and the
+   FInAT suite passed. See `plan-corrections.md` section 7.1.
+
+The plan gives, for each mutation, the tests that must fail. On the real code each
+of these tests fails (in-memory patches, one fresh kernel cache for each run).
+
+### 8.5 The parallel evidence
+
+The parallel evidence comes from direct `mpiexec` drivers, not from pytest
+(section 6). The code was a `git archive` snapshot of `b52574371`, with fiat
+`a6979469`. That is the code of C7, before C8.
+
+| Evidence | Scope | Result |
+|---|---|---|
+| The 12 `parallel([1, 2, 3])` tests of the `dS` section of `test_prism.py`, plus 4 bodies of `test_prism_interior_facets_core.py` | 57 cases | pass at 2 and at 3 ranks |
+| Rank independence: 6 meshes, the default partitioner at 1, 2 and 3 ranks, a shell partition at 2 and 3 ranks | the facet number and the orientation of each side, the vertex order of each cell, the areas, the point and jump checks, and a DG2 matrix and solve | the facet data is identical at 1, 2 and 3 ranks; the largest relative difference of a functional is 7.9e-13 |
+| Mutations at 3 ranks | the orientation of `'-'` replaced by that of `'+'`; the triangle permutation removed | 25 of 57 cases fail; the functionals change by about 1e-2 |
+| `test_prism_dS_on_a_partition_boundary` (`8b6155581`) | degrees 2 and 3 | pass at 2 and at 3 ranks; fails at 3 ranks with the triangle permutation removed |
+| The C7 and C8 tests (`test_prism_submesh.py`) in parallel | | **pending** |
+| The whole `tests/firedrake/submesh` suite in parallel after C8 (327 parallel-only tests) | | **pending** |
+
+Not covered in parallel: `test_prism_dS_sipg_converges_at_the_expected_order`
+(serial by design), and the error tests (serial; an error does not depend on the
+partition). `test_prism_interior_facets_core.py` and `test_prism_submesh.py` have
+no parallel mark.
+
+### 8.6 How to run the Phase C tests
+
+**Caution.** Use a new `FIREDRAKE_TSFC_KERNEL_CACHE_DIR` and `PYOP2_CACHE_DIR` for
+a check whose result depends on the generated code. A cached kernel can hide a
+change.
+
+Serial. Run one `pytest` command for each file:
+
+```
+source ../venv-firedrake/bin/activate
+python -m pytest -m "parallel[1] or not parallel" --timeout-method=signal \
+    tests/firedrake/regression/test_prism.py
+```
+
+Do the same for `tests/firedrake/regression/test_prism_interior_facets_core.py`,
+`tests/firedrake/regression/test_prism_submesh.py` and
+`tests/tsfc/test_prism_facet_integrals.py`. In `../fiat`, run
+`python -m pytest test/finat`. `test_prism.py` and the core file take about 12 to
+14 minutes together in serial. Do not select with `-k "not parallel"`: `-k` also
+matches marker names (section 6).
+
+Parallel. The at-exit teardown deadlock of section 6 also stops these tests after
+they pass. So call the test bodies from a direct driver:
+
+- Load the test module by path (`importlib.util.spec_from_file_location`) and call
+  each test function with each parameter set. A fixture (for example
+  `interior_mesh` of `test_prism_submesh.py`) does not run, so make its value in
+  the driver.
+- After each case, `allgather` the status of each rank. A case passes only if it
+  passes on all ranks.
+- End with a barrier and `os._exit(0)`. Print with `flush=True`, because
+  `os._exit` does not flush the output buffers. `prterun` then reports "exiting
+  improperly" and exit code 1. This is expected.
+- Start it with `mpiexec -n 2 python -u driver.py`, then with `-n 3`. Run one MPI
+  job at a time. Kill a stuck job by the name of its script only, never with
+  `pkill -f prterun`.
