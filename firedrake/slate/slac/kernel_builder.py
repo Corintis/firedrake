@@ -458,10 +458,14 @@ class LocalLoopyKernelBuilder:
                             # of these types selects its facet by POSITION in
                             # its facet shape group, so to add them to the dict
                             # below would give wrong answers on the triangular
-                            # facets of a prism, with no error.
+                            # facets of a prism, with no error. Slate turns a
+                            # dS into a ds before it compiles it (see
+                            # transform_integrals), so name the integral type
+                            # of the form, not the type of the kernel.
+                            measure = {"exterior_facet": "ds", "interior_facet": "dS"}[integral_type]
                             raise NotImplementedError(
                                 "Slate does not support facet integrals on prism "
-                                "cells (integral type %s)" % kinfo.integral_type)
+                                "cells (integral type %s, measure %s)" % (integral_type, measure))
                         if kinfo.active_domain_numbers._asdict()[{"exterior_facet": "exterior_facets",
                                                                   "exterior_facet_vert": "exterior_facets",
                                                                   "interior_facet": "interior_facets",
