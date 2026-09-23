@@ -243,6 +243,19 @@ UP = ctypes.POINTER(ctypes.c_uint32)
 REF = np.array([[0, 0, 0], [0, 0, 1], [1, 0, 0], [1, 0, 1], [0, 1, 0], [0, 1, 1]], float)
 
 
+def facet_measure(which):
+    """The measure over the facets of one shape.
+
+    Phase B gives TSFC one integral type per facet shape, so the native path
+    selects the shape with the measure. The Appendix A prototype patch reads
+    SHAPE["which"] inside lower_integral_type instead, so it keeps ds.
+    """
+    if not NATIVE:
+        return ufl.ds(domain=UFLMESH)
+    name = "exterior_facet_quad" if which == "quad" else "exterior_facet_tri"
+    return ufl.Measure(name, domain=UFLMESH)
+
+
 def build(form):
     k, = tsfc.compile_form(form, parameters={"mode": "spectral"})
     d = tempfile.mkdtemp()
@@ -285,7 +298,7 @@ try:
         SHAPE["which"] = which
         if hasattr(tsfc.fem.get_quadrature_rule, "cache_clear"):
             tsfc.fem.get_quadrature_rule.cache_clear()
-        fn = build(ufl.as_ufl(1.0) * ufl.ds(domain=UFLMESH))
+        fn = build(ufl.as_ufl(1.0) * facet_measure(which))
         for pos, ent in enumerate(ents):
             A = np.zeros(1)
             c = np.ascontiguousarray(REF, dtype=float).ravel()
@@ -300,7 +313,8 @@ try:
     SHAPE["which"] = "quad"
     V = ufl.FunctionSpace(UFLMESH, finat.ufl.FiniteElement("Lagrange", CELL, 2))
     n = ufl.FacetNormal(UFLMESH)
-    tsfc.compile_form(ufl.inner(ufl.grad(ufl.Coefficient(V)), n) * ufl.TestFunction(V) * ufl.ds,
+    tsfc.compile_form(ufl.inner(ufl.grad(ufl.Coefficient(V)), n) * ufl.TestFunction(V)
+                      * facet_measure(SHAPE["which"]),
                       parameters={"mode": "spectral"})
     check(4, "FacetNormal form compiles", True, True)
 except Exception as exc:

@@ -12,7 +12,8 @@ import gem
 import gem.impero_utils as impero_utils
 import petsctools
 import numpy
-from FIAT.reference_element import TensorProductCell
+import ufl
+from FIAT.reference_element import TensorProductCell, QUADRILATERAL, TRIANGLE
 from finat.cell_tools import max_complex
 from finat.quadrature import AbstractQuadratureRule
 from gem.node import traversal
@@ -249,10 +250,11 @@ class KernelBuilderMixin(object):
         integral_type = info.integral_type
         cell = info.domain.ufl_cell()
         fiat_cell = as_fiat_cell(cell)
-        integration_dim, _ = lower_integral_type(fiat_cell, integral_type)
+        integration_dim, entity_ids = lower_integral_type(fiat_cell, integral_type)
         return dict(interface=self,
                     ufl_cell=cell,
                     integration_dim=integration_dim,
+                    integration_entity=entity_ids[0],
                     scalar_type=self.fem_scalar_type)
 
     def create_context(self):
@@ -351,8 +353,9 @@ def set_quad_rule(params, cell, integral_type, functions):
                 fiat_cells = [c if c.get_dimension() == dimension else
                               c.construct_subcomplex(dimension) for c in fiat_cells]
             fiat_cell = max_complex(fiat_cells)
-        integration_dim, _ = lower_integral_type(fiat_cell, integral_type)
-        quad_rule = fem.get_quadrature_rule(fiat_cell, integration_dim, quadrature_degree, scheme)
+        integration_dim, entity_ids = lower_integral_type(fiat_cell, integral_type)
+        quad_rule = fem.get_quadrature_rule(fiat_cell, integration_dim, quadrature_degree,
+                                            scheme, entity_ids[0])
         params["quadrature_rule"] = quad_rule
 
     if not isinstance(quad_rule, AbstractQuadratureRule):
@@ -389,9 +392,44 @@ def get_index_names(quadrature_indices, argument_multiindices, index_cache):
     return index_names
 
 
+# The facet shape of the integral types that a cell with more than one facet
+# shape needs. A prism has three quadrilateral facets and two triangular ones,
+# so one ``ds`` becomes one integral of each type.
+shape_facet_types = {'exterior_facet_tri': TRIANGLE,
+                     'exterior_facet_quad': QUADRILATERAL}
+
+# UFL keeps only the integrals whose type it knows: ``group_form_integrals``
+# walks ``ufl.measure.integral_types()`` and drops the rest without a message.
+# Register the two types here, where they are defined.
+for _integral_type, _measure_name in (('exterior_facet_tri', 'ds_tri'),
+                                      ('exterior_facet_quad', 'ds_quad')):
+    ufl.measure.register_integral_type(_integral_type, _measure_name)
+    # A form that also holds an interior facet integral reads this map. The
+    # two entries are new keys, so no existing entry changes.
+    ufl.algorithms.apply_restrictions.default_restriction_map.setdefault(_integral_type, None)
+
+
+def facet_shape_entities(fiat_cell, integration_dim):
+    """Group the subentities of one dimension by the shape of their reference cell.
+
+    :arg fiat_cell: FIAT reference cell
+    :arg integration_dim: subentity dimension (integer)
+    :returns: a dict from FIAT shape code to the sorted list of entity numbers
+    """
+    groups = collections.OrderedDict()
+    for entity in sorted(fiat_cell.get_topology()[integration_dim]):
+        shape = fiat_cell.construct_subelement(integration_dim, entity=entity).get_shape()
+        groups.setdefault(shape, []).append(entity)
+    return groups
+
+
 def lower_integral_type(fiat_cell, integral_type):
     """Lower integral type into the dimension of the integration
     subentity and a list of entity numbers for that dimension.
+
+    The entity numbers are in ascending order, and every one of them gives the
+    same reference cell. The kernel selects among them by POSITION in this
+    list, not by entity number. See `tsfc.fem.ContextBase.entity_selector`.
 
     :arg fiat_cell: FIAT reference cell
     :arg integral_type: integral type (string)
@@ -403,6 +441,16 @@ def lower_integral_type(fiat_cell, integral_type):
     if integral_type == 'cell':
         integration_dim = dim
     elif integral_type in ['exterior_facet', 'interior_facet']:
+        if isinstance(fiat_cell, TensorProductCell):
+            raise ValueError("{} integral cannot be used with a TensorProductCell; need to distinguish between vertical and horizontal contributions.".format(integral_type))
+        integration_dim = dim - 1
+        if len(facet_shape_entities(fiat_cell, integration_dim)) > 1:
+            raise ValueError(
+                "{} integral cannot be used with this cell; its facets have "
+                "more than one shape, so the integral must be split into one "
+                "integral per shape ({}).".format(
+                    integral_type, ', '.join(sorted(shape_facet_types))))
+    elif integral_type in shape_facet_types:
         if isinstance(fiat_cell, TensorProductCell):
             raise ValueError("{} integral cannot be used with a TensorProductCell; need to distinguish between vertical and horizontal contributions.".format(integral_type))
         integration_dim = dim - 1
@@ -426,8 +474,19 @@ def lower_integral_type(fiat_cell, integral_type):
         entity_ids = [0]
     elif integral_type == 'exterior_facet_top':
         entity_ids = [1]
+    elif integral_type in shape_facet_types:
+        groups = facet_shape_entities(fiat_cell, integration_dim)
+        if len(groups) == 1:
+            raise ValueError(
+                "{} integral requires a cell whose facets have more than one "
+                "shape; use an exterior_facet integral with this cell.".format(integral_type))
+        try:
+            entity_ids = groups[shape_facet_types[integral_type]]
+        except KeyError:
+            raise ValueError(
+                "{} integral requires a cell with a facet of that shape.".format(integral_type))
     else:
-        entity_ids = list(fiat_cell.get_topology()[integration_dim])
+        entity_ids = sorted(fiat_cell.get_topology()[integration_dim])
 
     return integration_dim, entity_ids
 

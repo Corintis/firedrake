@@ -53,6 +53,7 @@ class ContextBase(ProxyKernelInterface):
         'ufl_cell',
         'fiat_cell',
         'integration_dim',
+        'integration_entity',
         'argument_multiindices',
         'facetarea',
         'index_cache',
@@ -82,6 +83,28 @@ class ContextBase(ProxyKernelInterface):
             integration_dims.add(integration_dim)
         integration_dim, = integration_dims
         return integration_dim
+
+    @cached_property
+    def integration_entity(self):
+        """The entity that stands for the integration subentity.
+
+        The integral type fixes one facet shape, so every entity that
+        :func:`lower_integral_type` returns has the same reference cell. The
+        first entity therefore represents them all, and the reference cell and
+        the quadrature rule built from it are correct for each of them.
+        """
+        entities = set()
+        for domain, integral_type in self.domain_integral_type_map.items():
+            cell = domain.ufl_cell()
+            fiat_cell = as_fiat_cell(cell)
+            _, entity_ids = lower_integral_type(fiat_cell, integral_type)
+            entities.add(entity_ids[0])
+        if len(entities) > 1:
+            raise NotImplementedError(
+                "The domains of this integral do not share one integration "
+                "entity. Pass integration_entity for the integration domain.")
+        entity, = entities
+        return entity
 
     @cached_property
     def epsilon(self):
@@ -327,9 +350,9 @@ def needs_coordinate_mapping(element):
         return isinstance(create_element(element), NeedsCoordinateMappingElement)
 
 
-@serial_cache(hashkey=lambda *args: args)
-def get_quadrature_rule(fiat_cell, integration_dim, quadrature_degree, scheme):
-    integration_cell = fiat_cell.construct_subcomplex(integration_dim)
+@serial_cache(hashkey=lambda *args, **kwargs: args + tuple(sorted(kwargs.items())))
+def get_quadrature_rule(fiat_cell, integration_dim, quadrature_degree, scheme, entity=None):
+    integration_cell = fiat_cell.construct_subcomplex(integration_dim, entity=entity)
     return make_quadrature(integration_cell, quadrature_degree, scheme=scheme)
 
 
@@ -345,7 +368,8 @@ class PointSetContext(ContextBase):
 
     @cached_property
     def quadrature_rule(self):
-        return get_quadrature_rule(self.fiat_cell, self.integration_dim, self.quadrature_degree, "default")
+        return get_quadrature_rule(self.fiat_cell, self.integration_dim, self.quadrature_degree,
+                                   "default", self.integration_entity)
 
     @cached_property
     def point_set(self):
@@ -520,7 +544,7 @@ def translate_cell_facet_jacobian(terminal, mt, ctx):
 
 
 def make_cell_facet_jacobian(cell, facet_dim, facet_i):
-    facet_cell = cell.construct_subelement(facet_dim)
+    facet_cell = cell.construct_subelement(facet_dim, entity=facet_i)
     xs = facet_cell.get_vertices()
     ys = cell.get_vertices_of_subcomplex(cell.get_topology()[facet_dim][facet_i])
 
@@ -624,8 +648,8 @@ def translate_facetarea(terminal, mt, ctx):
     integrand, degree = one_times(ufl.Measure(integral_type, domain=domain))
 
     config = {name: getattr(ctx, name)
-              for name in ["ufl_cell", "integration_dim", "scalar_type",
-                           "index_cache"]}
+              for name in ["ufl_cell", "integration_dim", "integration_entity",
+                           "scalar_type", "index_cache"]}
     config.update(interface=ctx, quadrature_degree=degree, use_canonical_quadrature_point_ordering=False)
     expr, = compile_ufl(integrand, PointSetContext(**config), point_sum=True)
     return expr
