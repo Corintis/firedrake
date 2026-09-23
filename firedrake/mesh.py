@@ -1531,6 +1531,7 @@ class MeshTopology(AbstractMeshTopology):
         assert tdim == cell.topological_dimension
         if self.submesh_parent is not None and \
                 not (self.submesh_parent.ufl_cell().cellname == "hexahedron" and cell.cellname == "quadrilateral") and \
+                not (self.submesh_parent.ufl_cell().cellname == "prism" and cell.cellname in {"triangle", "quadrilateral"}) and \
                 len(self.submesh_parent.dm_cell_types) == 1:
             # Codim-1 submesh of a hex mesh (i.e. a quad submesh) can not
             # inherit cell_closure from the hex mesh as the cell_closure
@@ -1538,6 +1539,11 @@ class MeshTopology(AbstractMeshTopology):
             # that, when the quad submesh works with the parent hex mesh,
             # quadrature points must be permuted (i.e. use the canonical
             # quadrature point ordering based on the cone ordering).
+            # A codim-1 submesh of a prism mesh can not inherit either: the
+            # prism closure keeps the cone order, so the triangles would not
+            # be sorted and the quads would not follow the orientation
+            # restriction. The two sides of a submesh facet then see
+            # different point orders.
             topology = FIAT.ufc_cell(cell).get_topology()
             entity_per_cell = np.zeros(len(topology), dtype=IntType)
             for d, ents in topology.items():
