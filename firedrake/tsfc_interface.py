@@ -18,6 +18,7 @@ from tsfc.parameters import PARAMETERS as tsfc_default_parameters
 from tsfc.ufl_utils import extract_firedrake_constants
 from tsfc.kernel_interface.firedrake_loopy import ActiveDomainNumbers
 from tsfc.kernel_interface.common import shape_facet_types, interior_shape_facet_types
+from FIAT.reference_element import QUADRILATERAL, TRIANGLE
 
 from pyop2 import op2
 from pyop2.caching import memory_and_disk_cache, default_parallel_hashkey
@@ -268,6 +269,12 @@ def compile_form(form, name, parameters=None, split=True, dont_split=(), diagona
     return kernels
 
 
+def _has_facet_shapes(domain):
+    """Return True if the facets of the cells of ``domain`` have more than one shape."""
+    cell = domain.ufl_cell()
+    return isinstance(cell, ufl.Cell) and len(cell.facet_types) > 1
+
+
 def _split_facet_integrals_by_shape(form, parameters):
     """Split each facet integral on a cell with more than one facet shape.
 
@@ -279,32 +286,64 @@ def _split_facet_integrals_by_shape(form, parameters):
     mesh intersects the subdomain with the facet shape. Integrals on every
     other cell are returned unchanged.
 
-    The two integrals get the same metadata. A ``QuadratureRule`` object is
+    An integral over more than one mesh (``intersect_measures``) can couple
+    the facets of a prism mesh with the cells of a facet submesh. The cells
+    of the submesh have one shape, so only the facet type of that shape is
+    kept, and the facet types of the other domains of the integral change to
+    the same shape.
+
+    The integrals get the same metadata. A ``QuadratureRule`` object is
     for one reference facet only, so the other facet shape would use it too
-    and give a wrong answer. Such a rule raises ``NotImplementedError``.
+    and give a wrong answer. Such a rule raises ``NotImplementedError``,
+    unless the integral keeps one facet shape only.
     """
     split_types = {"exterior_facet": ("exterior facet integral (ds)", shape_facet_types),
                    "interior_facet": ("interior facet integral (dS)", interior_shape_facet_types)}
+    cell_shapes = {"triangle": TRIANGLE, "quadrilateral": QUADRILATERAL}
     integrals = []
+    changed = False
     for integral in form.integrals():
-        cell = integral.ufl_domain().ufl_cell()
-        if (integral.integral_type() in split_types
-                and isinstance(cell, ufl.Cell) and len(cell.facet_types) > 1):
-            name, types = split_types[integral.integral_type()]
-            # The integral metadata overrides the form compiler parameters,
-            # as in tsfc.driver.
-            rule = {**parameters, **integral.metadata()}.get("quadrature_rule")
-            if rule is not None and not isinstance(rule, str):
-                raise NotImplementedError(
-                    f"A QuadratureRule object is not supported for an {name} "
-                    f"on a {cell.cellname} mesh, because its facets "
-                    f"have more than one shape and a rule is for one shape only. "
-                    f"Use 'quadrature_degree' or a scheme name instead.")
-            integrals.extend(integral.reconstruct(integral_type=integral_type)
-                             for integral_type in sorted(types))
-        else:
+        domain_types = {integral.ufl_domain(): integral.integral_type(),
+                        **integral.extra_domain_integral_type_map()}
+        split = {d: t for d, t in domain_types.items()
+                 if t in split_types and _has_facet_shapes(d)}
+        if not split:
             integrals.append(integral)
-    if len(integrals) == len(form.integrals()):
+            continue
+        changed = True
+        shapes = {TRIANGLE, QUADRILATERAL}
+        for d, t in domain_types.items():
+            if d in split:
+                continue
+            if t == "cell" and d.ufl_cell().cellname in cell_shapes:
+                # The cells of a facet submesh fix the facet shape.
+                shapes &= {cell_shapes[d.ufl_cell().cellname]}
+            else:
+                name, _ = split_types[next(iter(split.values()))]
+                raise NotImplementedError(
+                    f"An integral that couples the {name} of a mesh whose facets "
+                    f"have more than one shape with a {t} integral on a "
+                    f"{d.ufl_cell().cellname} mesh is not supported. Couple it with "
+                    f"the cells of a facet submesh, or with a facet integral.")
+        # The integral metadata overrides the form compiler parameters,
+        # as in tsfc.driver.
+        rule = {**parameters, **integral.metadata()}.get("quadrature_rule")
+        if rule is not None and not isinstance(rule, str) and len(shapes) > 1:
+            name, _ = split_types[next(iter(split.values()))]
+            raise NotImplementedError(
+                f"A QuadratureRule object is not supported for an {name} "
+                f"on a {integral.ufl_domain().ufl_cell().cellname} mesh, because its facets "
+                f"have more than one shape and a rule is for one shape only. "
+                f"Use 'quadrature_degree' or a scheme name instead.")
+        # Keep the order of the type names: quadrilateral, then triangle.
+        for shape in [s for s in (QUADRILATERAL, TRIANGLE) if s in shapes]:
+            new_types = {d: next(k for k, v in split_types[t][1].items() if v == shape)
+                         for d, t in split.items()}
+            integral_type = new_types.get(integral.ufl_domain(), integral.integral_type())
+            extra = {d: new_types.get(d, t) for d, t in integral.extra_domain_integral_type_map().items()}
+            integrals.append(integral.reconstruct(integral_type=integral_type,
+                                                  extra_domain_integral_type_map=extra))
+    if not changed:
         return form
     return Form(integrals)
 

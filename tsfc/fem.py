@@ -35,7 +35,7 @@ from ufl.algorithms import extract_arguments
 
 from tsfc import ufl2gem
 from tsfc.kernel_interface import ProxyKernelInterface
-from tsfc.kernel_interface.common import lower_integral_type, interior_shape_facet_types
+from tsfc.kernel_interface.common import lower_integral_type, interior_shape_facet_types, shape_facet_types
 from tsfc.modified_terminals import (analyse_modified_terminal,
                                      construct_modified_terminal)
 from tsfc.parameters import is_complex
@@ -162,6 +162,12 @@ class ContextBase(ProxyKernelInterface):
             # hexahedron, so the two sides of an interior facet see it in
             # different orientations. The exterior shape types do not need
             # this, because they read one side only.
+            return True
+        elif _any(UFCPrism, list(shape_facet_types)) and \
+                sum(it is not None for it in self.domain_integral_type_map.values()) > 1:
+            # An exterior facet of a prism mesh that meets the cell of a
+            # submesh: the prism and the submesh cell see the facet in
+            # different orientations.
             return True
         elif _any(UFCQuadrilateral, ['exterior_facet', 'interior_facet']) and _any(UFCSimplex, ['cell', 'exterior_facet', 'interior_facet']):
             return True

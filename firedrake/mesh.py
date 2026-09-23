@@ -209,6 +209,32 @@ def _generate_default_mesh_topology_permutation_name(reorder):
     return "_".join(["firedrake", "default", str(reorder)])
 
 
+def _plain_facet_integral_type(integral_type):
+    """Return the facet integral type of a shape type, or the type itself.
+
+    A prism mesh splits ``exterior_facet`` and ``interior_facet`` into one
+    type per facet shape. The maps between a mesh and its submesh do not
+    depend on the facet shape.
+    """
+    if integral_type in shape_facet_types:
+        return "exterior_facet"
+    elif integral_type in interior_shape_facet_types:
+        return "interior_facet"
+    else:
+        return integral_type
+
+
+def _shape_facet_integral_type(integral_type, shape):
+    """Return the shape type of a facet integral type for one facet shape.
+
+    :arg integral_type: ``"exterior_facet"`` or ``"interior_facet"``.
+    :arg shape: A FIAT shape code of the facet.
+    """
+    types = shape_facet_types if integral_type == "exterior_facet" else interior_shape_facet_types
+    integral_type, = (t for t, s in types.items() if s == shape)
+    return integral_type
+
+
 class _Facets(object):
     """Wrapper class for facet interation information on a :func:`Mesh`
 
@@ -1932,6 +1958,8 @@ class MeshTopology(AbstractMeshTopology):
         else:
             source = self
             target = self.submesh_parent
+        source_shape_integral_type = source_integral_type
+        source_integral_type = _plain_facet_integral_type(source_integral_type)
         target_dim = target.topology_dm.getDimension()
         source_dim = source.topology_dm.getDimension()
         if target_dim == source_dim:
@@ -1998,6 +2026,12 @@ class MeshTopology(AbstractMeshTopology):
                 if n_ext > len(source_subset_points):
                     raise RuntimeError("Found inconsistent data")
                 target_integral_type = "exterior_facet"
+            elif source_shape_integral_type != source_integral_type:
+                # A prism mesh splits a facet integral into one kernel per
+                # facet shape, and the subdomain can hold no facet of this
+                # shape on any rank. The kernel then iterates over nothing, so
+                # use the facets of the same kind on the target.
+                target_integral_type = source_integral_type
             else:
                 raise RuntimeError("Can not find a map from source to target.")
             if reverse:
@@ -2011,6 +2045,19 @@ class MeshTopology(AbstractMeshTopology):
             map_ = getattr(self, f"submesh_parent_{source_integral_type}_child_{target_integral_type}_map")
         else:
             map_ = getattr(self, f"submesh_child_{source_integral_type}_parent_{target_integral_type}_map")
+        target_cell = target.ufl_cell()
+        if target_integral_type in ("exterior_facet", "interior_facet") and \
+                isinstance(target_cell, ufl.Cell) and len(target_cell.facet_types) > 1:
+            # The kernel on a prism mesh selects the facet by its position in
+            # the facets of one shape, so give the shape type. The shape is
+            # that of the source facets, or of the cells of a facet submesh.
+            if source_shape_integral_type in shape_facet_types:
+                facet_shape = shape_facet_types[source_shape_integral_type]
+            elif source_shape_integral_type in interior_shape_facet_types:
+                facet_shape = interior_shape_facet_types[source_shape_integral_type]
+            else:
+                facet_shape = as_fiat_cell(source.ufl_cell()).get_shape()
+            target_integral_type = _shape_facet_integral_type(target_integral_type, facet_shape)
         return map_, target_integral_type, target_subset_points
 
     # trans mesh
@@ -2044,19 +2091,16 @@ class MeshTopology(AbstractMeshTopology):
             if base_integral_type == "cell":
                 base_subset = base_mesh.measure_set(base_integral_type, base_subdomain_id, all_integer_subdomain_ids=base_all_integer_subdomain_ids)
                 base_subset_points = base_mesh.cell_closure[:, -1][base_subset.indices]
-            elif base_integral_type in ["interior_facet", "exterior_facet"]:
+            elif _plain_facet_integral_type(base_integral_type) in ["interior_facet", "exterior_facet"]:
+                # The measure set of a shape type holds the facets of that
+                # shape only.
                 base_subset = base_mesh.measure_set(base_integral_type, base_subdomain_id, all_integer_subdomain_ids=base_all_integer_subdomain_ids)
-                if base_integral_type == "interior_facet":
+                if _plain_facet_integral_type(base_integral_type) == "interior_facet":
                     _interior_facet_numbers, _, _ = base_mesh._interior_facet_numbers_classes_set
                     base_subset_points = _interior_facet_numbers[base_subset.indices]
-                elif base_integral_type == "exterior_facet":
+                else:
                     _exterior_facet_numbers, _, _ = base_mesh._exterior_facet_numbers_classes_set
                     base_subset_points = _exterior_facet_numbers[base_subset.indices]
-            elif base_integral_type in shape_facet_types or base_integral_type in interior_shape_facet_types:
-                raise NotImplementedError(
-                    f"An integral over more than one mesh is not supported for the "
-                    f"integral type {base_integral_type} of a prism mesh (a ds or a "
-                    f"dS on a mesh whose facets have more than one shape)")
             else:
                 raise NotImplementedError(f"Unknown integration type : {base_integral_type}")
             composed_map, integral_type, _ = self.submesh_map_composed(base_mesh, base_integral_type, base_subset_points)

@@ -1905,7 +1905,7 @@ def _as_global_kernel_arg_exterior_facet(_, self):
         return op2.DatKernelArg((1,))
     else:
         m, integral_type = mesh.topology.trans_mesh_entity_map(self._mesh.topology, self._integral_type, self._subdomain_id, self._all_integer_subdomain_ids)
-        assert integral_type == "exterior_facet"
+        assert integral_type in ("exterior_facet", *shape_facet_types)
         return op2.DatKernelArg((1,), m._global_kernel_arg)
 
 
@@ -1916,7 +1916,7 @@ def _as_global_kernel_arg_interior_facet(_, self):
         return op2.DatKernelArg((2,))
     else:
         m, integral_type = mesh.topology.trans_mesh_entity_map(self._mesh.topology, self._integral_type, self._subdomain_id, self._all_integer_subdomain_ids)
-        assert integral_type == "interior_facet"
+        assert integral_type in ("interior_facet", *interior_shape_facet_types)
         return op2.DatKernelArg((2,), m._global_kernel_arg)
 
 
@@ -1938,7 +1938,7 @@ def _(_, self):
         return op2.DatKernelArg((1,))
     else:
         m, integral_type = mesh.topology.trans_mesh_entity_map(self._mesh.topology, self._integral_type, self._subdomain_id, self._all_integer_subdomain_ids)
-        assert integral_type == "exterior_facet"
+        assert integral_type in ("exterior_facet", *shape_facet_types)
         return op2.DatKernelArg((1,), m._global_kernel_arg)
 
 
@@ -1949,7 +1949,7 @@ def _(_, self):
         return op2.DatKernelArg((2,))
     else:
         m, integral_type = mesh.topology.trans_mesh_entity_map(self._mesh.topology, self._integral_type, self._subdomain_id, self._all_integer_subdomain_ids)
-        assert integral_type == "interior_facet"
+        assert integral_type in ("interior_facet", *interior_shape_facet_types)
         return op2.DatKernelArg((2,), m._global_kernel_arg)
 
 
@@ -2268,10 +2268,13 @@ def _as_parloop_arg_exterior_facet(_, self):
     mesh = next(self._active_exterior_facets)
     if mesh is self._mesh:
         m = None
+        integral_type = self._integral_type
     else:
+        # The integral type on this mesh, which can be a shape type of a
+        # prism mesh when self._mesh is a facet submesh of it.
         m, integral_type = mesh.topology.trans_mesh_entity_map(self._mesh.topology, self._integral_type, self._subdomain_id, self._all_integer_subdomain_ids)
-        assert integral_type == "exterior_facet"
-    if self._integral_type in shape_facet_types:
+        assert integral_type in ("exterior_facet", *shape_facet_types)
+    if integral_type in shape_facet_types:
         # The kernel selects the facet by its position within its shape group.
         return op2.DatParloopArg(mesh.exterior_facets.shape_local_facet_dat, m)
     return op2.DatParloopArg(mesh.exterior_facets.local_facet_dat, m)
@@ -2282,10 +2285,13 @@ def _as_parloop_arg_interior_facet(_, self):
     mesh = next(self._active_interior_facets)
     if mesh is self._mesh:
         m = None
+        integral_type = self._integral_type
     else:
+        # The integral type on this mesh, which can be a shape type of a
+        # prism mesh when self._mesh is a facet submesh of it.
         m, integral_type = mesh.topology.trans_mesh_entity_map(self._mesh.topology, self._integral_type, self._subdomain_id, self._all_integer_subdomain_ids)
-        assert integral_type == "interior_facet"
-    if self._integral_type in interior_shape_facet_types:
+        assert integral_type in ("interior_facet", *interior_shape_facet_types)
+    if integral_type in interior_shape_facet_types:
         # The kernel selects the facet by its position within its shape group.
         return op2.DatParloopArg(mesh.interior_facets.shape_local_facet_dat, m)
     return op2.DatParloopArg(mesh.interior_facets.local_facet_dat, m)
@@ -2309,7 +2315,7 @@ def _(_, self):
         m = None
     else:
         m, integral_type = mesh.topology.trans_mesh_entity_map(self._mesh.topology, self._integral_type, self._subdomain_id, self._all_integer_subdomain_ids)
-        assert integral_type == "exterior_facet"
+        assert integral_type in ("exterior_facet", *shape_facet_types)
     return op2.DatParloopArg(mesh.exterior_facets.local_facet_orientation_dat, m)
 
 
@@ -2320,7 +2326,7 @@ def _(_, self):
         m = None
     else:
         m, integral_type = mesh.topology.trans_mesh_entity_map(self._mesh.topology, self._integral_type, self._subdomain_id, self._all_integer_subdomain_ids)
-        assert integral_type == "interior_facet"
+        assert integral_type in ("interior_facet", *interior_shape_facet_types)
     return op2.DatParloopArg(mesh.interior_facets.local_facet_orientation_dat, m)
 
 
