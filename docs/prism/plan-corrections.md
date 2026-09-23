@@ -1,5 +1,8 @@
 # Corrections to `prism_unstructured_implementation_plan.md`
 
+The plan is a local, untracked file. It is NOT in the repository. Each item below
+quotes the claim of the plan that it corrects, so this file is complete without it.
+
 Every item below was established by running code, not by reading it. Each says
 what the plan claims, what is actually true, and the evidence. To be folded into
 the plan document when the branch is finished.
@@ -25,7 +28,7 @@ A neighbour whose axis runs differently through that same face sees those slots
 holding its own axis edges. So an unstructured prism mesh genuinely presents all
 8 quadrilateral orientations, while FInAT supplies 4.
 
-**Evidence.** `prism_meshes/prism_two_perpendicular.msh`:
+**Evidence.** `tests/firedrake/meshes/prism/prism_two_perpendicular.msh`:
 
 ```
 SHARED quad face 14: (cell, shipped, transposed) = [(0, 1, 5), (1, 6, 2)]
@@ -52,8 +55,19 @@ change, and leaves the quadrilateral, hexahedron and interval tables
 byte-identical. It handles perpendicular-axis meshes correctly instead of
 rejecting them.
 
+The change also affects the EXTRUDED wedge, `TensorProductCell(triangle, interval)`.
+Its vertical-face entity permutation dict at dimension (1, 1) grows from 4 to 8
+keys: `(0..1, 0..1, 0..1)` in place of `(0, 0..1, 0..1)`. The 4 old entries do not
+change, and `symmetry_group_size` does not change. The change is inert, because an
+extruded mesh always gives extrinsic part 0, so it reads only the old entries. The
+generated code of the extruded kernels is byte-identical (Tasks 5 and 8).
+
 **Consequence. Phase C should be deleted, not rescheduled.** The validator
 exists only to reject meshes the real fix accepts.
+
+**Note.** The name "Phase C" now means other work: interior facet integrals (`dS`)
+on prisms. The user needs them for weak interior-facet conditions.
+`phaseC_interior_facets_plan.md` gives that plan. The validator stays cancelled.
 
 ## 3. Section 4 — a missing layer: the global numbering
 
@@ -81,9 +95,10 @@ FAIL 0, SKIP 0 for stages 1 to 6.
 **Actually.** Unreachable and, where reachable, not diagnostic. Three
 independent reasons:
 
-1. **Stage 4 cannot pass until Phase B.** It needs a facet entity argument that
-   is Phase B work, and it only ever passed because the Appendix A.1 prototype
-   patch was applied — a patch the script drops the moment Phase A lands.
+1. **Stage 4 could not pass until Phase B. CLOSED.** It needed a facet entity
+   argument that is Phase B work, and it passed at first only because the
+   Appendix A.1 prototype patch was applied. Phase B (the `ds` split) landed, and
+   stage 4 then passed with no prototype.
 2. **Stage 6's `prism_warped.msh` assertions — the original claim here was
    WRONG, and is retracted.** It said a non-affine mesh cannot support an
    exactness test at any degree, because the space holds functions polynomial in
@@ -125,9 +140,15 @@ independent reasons:
 `tests/firedrake/regression/test_prism.py` — `V.dim()`, the empty mass rows and
 the CG2 Poisson solve — not the smoke test.
 
+**Status.** `prism_smoke_test.py` is removed from the repository. pytest collected
+it through the pattern `*_test.py`, and it stopped the collection with
+INTERNALERROR. The regression tests replace it. The last version is
+`git show c9a0f9fe7:prism_smoke_test.py`.
+
 ## 5. Section 5.4 / stage 7 — the shipped `eo` check proves nothing
 
 **Plan says.** Stage 7 of the smoke test verifies the `eo` agreement claim.
+(The script is removed now; see section 4.)
 
 **Actually.** As written it iterates Firedrake cells 0 and 1 assuming they are
 adjacent (RCM reordering breaks that), collects an `eo` from every interior quad
@@ -150,7 +171,8 @@ Practical guidance, each learned the hard way:
   destroys every other suite's results.
 - Use `--timeout-method=signal`. `thread` cannot interrupt the blocking
   `waitpid`, so pytest-timeout escalates and kills the whole run.
-- Reap orphaned MPI processes between suites. Leaked ranks from a stuck teardown
+- Reap orphaned MPI processes between suites, by the name of the script only,
+  never with a global `pkill -f prterun`. Leaked ranks from a stuck teardown
   do consume cores, so this is worth doing — but do not over-credit it. A large
   apparent speedup between a combined run and per-suite runs on this project was
   mostly a warm TSFC kernel cache, not the reaping.

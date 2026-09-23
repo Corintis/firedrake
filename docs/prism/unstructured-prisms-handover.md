@@ -3,6 +3,8 @@
 Branch: `prism-unstructured` (this repository) and `prism-unstructured` in `../fiat`.
 Base: `458649bba` here, `d0f9589d` there.
 Design document: `prism_unstructured_implementation_plan.md`, with corrections in section 3 below.
+That file is NOT in the repository. It is a local, untracked file. The corrections in
+`plan-corrections.md` are complete without it.
 
 This document records what was built, what the design document got wrong, and the
 things that cost the most time. It is written for whoever picks this up next.
@@ -17,17 +19,25 @@ prism may point in its own direction — loads, assembles and solves.
 | Capability | State |
 |---|---|
 | CG Lagrange on prisms, any degree | works |
+| DG and Real on prisms | works |
+| Other element families (for example "HDiv Trace", "Bernstein") | `NotImplementedError` from FInAT `convert_finiteelement`, which names the family |
 | Cell integrals (`dx`) | works |
 | Strong Dirichlet conditions | works |
 | Mixed function spaces, `aij` and `nest` | works, at 1, 2 and 3 ranks |
 | Convergence at the theoretical order | works, 2.03 / 3.00 / 4.07 at degrees 1, 2, 3 |
 | `locate_cell`, `Function.at`, `PointEvaluator` | works |
-| Mixed-cell meshes | unchanged from base (deliberately) |
-| VTK output, linear and higher-order | works |
+| Mixed-cell meshes | unchanged from base, with one exception: a mixed mesh that holds a pyramid or a `TRI_PRISM_TENSOR` cell now raises `NotImplementedError` (see 2.1) |
+| VTK output, linear and higher-order | works in serial; parallel output is not tested |
 | Checkpoint save and load | works |
 | MATIS assembly (`mat_type="is"`) of a mixed space | **broken, pre-existing, not prism-specific** — see below |
-| Facet integrals (`ds`) | Phase B, not yet done |
-| `dS`, H(div)/H(curl) on prisms, mixed tet/prism meshes | out of scope |
+| Exterior facet integrals (`ds`), with markers, "otherwise", Robin and Neumann conditions | works, at 1, 2 and 3 ranks (Phase B) |
+| `ds` with a `QuadratureRule` object in the metadata or the form compiler parameters | `NotImplementedError` from `_split_facet_integrals_by_shape`; use `quadrature_degree` or a scheme name |
+| `ds(subdomain_data=...)` | the same `NotImplementedError` as on the other meshes |
+| Slate facet integrals | `NotImplementedError`, which names prisms (Slate `kernel_builder.py`) |
+| `PatchPC` with `ds` | `NotImplementedError("Only for cell, interior facet, or exterior facet integrals")`, inside a PETSc error |
+| A `ds` over more than one mesh (`intersect_measures`) | `ValueError` from TSFC `lower_integral_type` |
+| Interior facet integrals (`dS`) | `NotImplementedError`, which names prisms; Phase C adds them (see `phaseC_interior_facets_plan.md`) |
+| H(div)/H(curl) on prisms, mixed tet/prism meshes | out of scope |
 
 **Read the mixed-space row as qualified, because it is.** Prism mixed spaces
 work with `aij` and `nest`; the `mat_type="is"` (MATIS) path is broken. The
@@ -38,7 +48,7 @@ will hit it.
 The reproducer, so the caveat is actionable:
 
 ```python
-mesh = Mesh("prism_meshes/prism_slab.msh")
+mesh = Mesh("tests/firedrake/meshes/prism/prism_slab.msh")
 W = VectorFunctionSpace(mesh, "CG", 1) * FunctionSpace(mesh, "CG", 1)
 u, v = TrialFunction(W), TestFunction(W)
 bcs = [DirichletBC(c, 0, (1, 2))
@@ -47,17 +57,18 @@ assemble(inner(grad(u), grad(v))*dx, bcs=bcs, mat_type="is", sub_mat_type="is")
 # IndexError: index 80 is out of bounds for axis 0 with size 80
 ```
 
-Drop the boundary conditions and it assembles. The failure is at
-`firedrake/functionspaceimpl.py:916`, in `FunctionSpace.local_to_global_map`,
-where `bc.nodes * block_size + component` overruns the sub-block map — the same
-line that fails `test_assemble_matis[True-mixed-is]` on a simplex mesh, so the
-prism is incidental. `assemble.py:2100` indexes the mixed space and calls the
-non-mixed method per block, which is why the `MixedFunctionSpace` method is not
-the one that raises.
+Drop the boundary conditions and it assembles. The failure is in
+`FunctionSpace.local_to_global_map` (`firedrake/functionspaceimpl.py`), at the
+line `indices[nodes] = -1`, where `bc.nodes * block_size + component` overruns
+the sub-block map — the same line that fails `test_assemble_matis[True-mixed-is]`
+on a simplex mesh, so the prism is incidental. `ParloopBuilder.collect_lgmaps`
+(`firedrake/assemble.py`) indexes the mixed space and calls the non-mixed method
+per block, which is why the `MixedFunctionSpace` method is not the one that
+raises.
 
-Separately, `MixedFunctionSpace.local_to_global_map` at
-`functionspaceimpl.py:1213` raises `NotImplementedError("Not for mixed maps
-right now sorry!")` for every mixed space on every cell. Neither defect is ours
+Separately, `MixedFunctionSpace.local_to_global_map` raises
+`NotImplementedError("Not for mixed maps right now sorry!")` for every mixed
+space on every cell. Neither defect is ours
 to fix, but together they block a monolithic mixed preconditioner on a prism
 mesh.
 
@@ -93,18 +104,23 @@ design document treated as small:
   checkpoint load of every mesh type. No guard can avoid it, because testing for
   the label computes it.
 
-Test meshes, all tracked in `prism_meshes/`:
+Test meshes, all tracked in `tests/firedrake/meshes/prism/`:
 
 | File | Contents | Why it exists |
 |---|---|---|
 | `prism_reference.msh` | 1 cell at the FIAT reference coordinates | hand-written; gmsh will not place a single prism at chosen coordinates |
-| `prism_slab.msh` | 52 cells, axes along +z, affine | the only mesh that can carry an exactness test |
+| `prism_reference_marked.msh` | the same cell, each facet in its own physical group | the `ds` tests measure each facet separately |
+| `prism_slab.msh` | 52 cells, axes along +z, affine | the exactness tests at every degree (`plan-corrections.md` section 4 gives the degree rule for the warped mesh) |
+| `prism_slab_mixed_marker.msh` | the `prism_slab.msh` cells; marker 4 holds triangular and quadrilateral facets | the `ds` tests of a marker with both facet shapes, and of "otherwise" |
 | `prism_warped.msh` | 52 cells, non-affine, axes tilt | non-affine geometry |
 | `prism_two_perpendicular.msh` | 2 cells whose axes are perpendicular | **the counterexample that disproved the first orientation fix** |
 | `prism_order_r0/r1/r2.msh` | 64, 512, 4096 cells, non-affine, each level halves the element size | the convergence order test; a Delaunay base at half the target size does not halve the element size, so these use a transfinite base |
 
-`prism_meshes/*.msh` is tracked via a `!` exception at `.gitignore:71`; the repository
-otherwise ignores `*.msh`.
+The repository ignores `*.msh`. These files are tracked with `git add -f`, as are
+the other meshes in `tests/firedrake/meshes/`. `make_prism_mesh.py` in the same
+directory writes all of them. It writes the two `prism_reference*.msh` files from
+hand-written text, and the others through gmsh. A missing mesh makes the prism tests
+fail, not skip.
 
 ---
 
@@ -124,7 +140,22 @@ Every solve above CG1 was singular.
 
 Fixed by keying the dof count on the DMPlex polytope type of the point rather than on
 its dimension stratum. Every cell type that existed before has one polytope type per
-dimension and therefore takes a byte-identical fast path.
+dimension and therefore takes a byte-identical fast path, EXCEPT a mixed-cell mesh.
+
+A mixed-cell mesh, for example `tests/firedrake/meshes/mixed_cell_unit_square.msh`,
+has triangles and quadrilaterals at dimension 2. So `_plex_polytope_types` splits
+that dimension, and `create_section`, `get_entity_classes_per_stratum` and
+`make_dofs_per_plex_entity` take the per-stratum path. Its section does not change,
+because the element gives each cell stratum the same dof count. The submesh
+mixed-cell tests pass (Step 1 of the end-of-branch run: `tests/firedrake/submesh`,
+387 passed, 0 failed). A mixed mesh that holds a pyramid or a `TRI_PRISM_TENSOR`
+cell now raises `NotImplementedError`.
+
+On the per-stratum path, `make_dofs_per_plex_entity` raises `NotImplementedError`
+when an element gives the entities of one polytope type different dof counts. This
+check is new for a dimension that has one polytope type. Before it, the count of
+entity 0 went to the whole stratum with no error, and "HDiv Trace" 0 on a prism gave
+a space of dimension 0.
 
 ### 2.2 A prism quad face genuinely needs all 8 orientations
 
@@ -150,14 +181,18 @@ load-bearing errors:
    the issue. The real defect was that the required orientation lies outside the range
    the element supplies.
 2. **Section 8.5's axis-consistency validator should not be built.** It exists to
-   reject exactly the meshes the section 8.7 fix handles correctly. Phase C is
-   cancelled, not deferred.
+   reject exactly the meshes the section 8.7 fix handles correctly. The validator
+   (the "Phase C" of the design document) is cancelled, not deferred. The name
+   "Phase C" now means other work: interior facet integrals (`dS`) on prisms,
+   which the user needs. `phaseC_interior_facets_plan.md` gives that plan.
 3. **Section 4 omits the numbering layer entirely** (see 2.1).
-4. **Section 12.5's Phase A exit criterion is unusable.** `prism_smoke_test.py` cannot
-   gate this work: stage 4 needs Phase B, and stage 6 is structurally blind to
+4. **Section 12.5's Phase A exit criterion is unusable.** `prism_smoke_test.py` could
+   not gate this work: stage 4 needed Phase B, and stage 6 is structurally blind to
    numbering defects — its output is byte-identical either side of a change that moves
    `V.dim()` from 403 to 325. The real gate is
-   `tests/firedrake/regression/test_prism.py`.
+   `tests/firedrake/regression/test_prism.py`. The script is removed from the
+   repository, because pytest collected it and stopped with INTERNALERROR. The last
+   version is `git show c9a0f9fe7:prism_smoke_test.py`.
 
 ---
 
@@ -236,7 +271,13 @@ What actually works:
 - **`--timeout-method=signal`, never `thread`.** `thread` cannot interrupt the
   blocking `waitpid`, so pytest-timeout escalates and kills the whole run.
 - **Reap orphaned MPI processes between suites**
-  (`pkill -9 -f "_PYTEST_MPI_CHILD_PROCESS"; pkill -9 -f prterun`).
+  (`pkill -9 -f "_PYTEST_MPI_CHILD_PROCESS"`). Kill a `prterun` by the name of
+  its script only. A global `pkill -f prterun` also kills the MPI jobs of other
+  users or agents.
+- **A parallel test that passes can still stop the run.** At 2 and 3 ranks,
+  `test_prism_boundary_condition_converges_at_the_expected_order` passed and then
+  hung in the teardown. It is now serial only. To test a body in parallel, call it
+  from a direct `mpiexec` driver that ends with `os._exit(0)`.
 - **Never run two MPI jobs at once.** It manufactures a symptom indistinguishable
   from a real hang, and cost roughly three hours here.
 - **`sample <pid> 5` on two ranks before killing anything.** A `PetscGarbageCleanup`
@@ -277,19 +318,37 @@ What actually works:
   after every `.pyx` edit, and never rebuild while another process has the
   extension mapped — overwriting a mapped `.so` can corrupt the running process.
 
-Seven pre-existing failure modes are catalogued in project memory under
-`firedrake-preexisting-test-failures`. The branch base produces 17 failures in
-`tests/firedrake/regression`; this branch produces 15.
+These failure modes are pre-existing. Each one also occurs at the base commit, or
+does not depend on the cell type:
 
-Reference counts, confirmed three times independently:
+1. The PETSc at-exit teardown deadlock (above). It fires on a passing test.
+2. A garbage collection re-entrancy segfault in `destroy` of `fdm.py` or
+   `facet_split.py`. It hits a different test on each run. `test_fdm.py` also has
+   5 `KeyError` failures.
+3. A tinyasm segfault at `preconditioners/asm.py`: `test_linesmoother.py` and
+   `test_star_pc.py`.
+4. The `EnrichedElement` dual basis: `multigrid/test_hiptmair.py::test_pmg_hiptmair_hcurl`.
+5. A missing optional dependency: `test_netgen.py` (`netgen`).
+6. A `petsctools` API mismatch: `multigrid/test_adaptive_multigrid.py` and
+   `multigrid/test_embedded_transfer.py`.
+7. A tolerance: `test_interior_elements.py::test_vanish_on_bdy` (1.79e-14 against 1e-14).
+8. MATIS mixed assembly: `test_assemble.py::test_assemble_matis[*-mixed*-is]`.
+9. A `RecursionError` in `tests/tsfc/test_dual_evaluation.py` (5 cases), identical
+   with FIAT at its base commit.
+
+The end-of-branch Step 1 run was stopped by the user before it finished. Its
+partial results, at commit f96d72298, before the fix wave:
 
 ```
-extrusion   581 passed,  0 failed
-submesh     387 passed,  0 failed
-slate       550 passed,  1 xfailed, 0 failed
-output      318 passed,  1 failed    (the teardown deadlock)
-multigrid   396 passed, 63 skipped, 1 failed
+prism files   513 passed, 6 failed   (each failure: the sampled teardown deadlock)
+tsfc          369 passed, 5 failed   (the count of test_dual_evaluation.py; not checked at base)
+extrusion     581 passed, 0 failed
+submesh       387 passed, 0 failed
 ```
+
+The output, multigrid, slate and regression suites were not run. One full run
+after Phase C replaces these numbers. The earlier counts (17 regression failures at
+the base, 15 on the branch) come from before Tasks 7 to 9 and are not current.
 
 ---
 
