@@ -996,6 +996,15 @@ class AbstractMeshTopology(object, metaclass=abc.ABCMeta):
         for dim in sorted(entity_dofs):
             counts = {entity: len(dofs) for entity, dofs in entity_dofs[dim].items()}
             if len(polytope_types[dim]) == 1:
+                # All the points of this dimension have one polytope type, so
+                # a count that changes between entities cannot go into one
+                # stratum. Stop here, because a count of entity 0 only loses
+                # the dofs of the other entities with no error.
+                if len(set(counts.values())) != 1:
+                    raise NotImplementedError(
+                        f"The element gives the dimension {dim} sub-entities, "
+                        "which have one polytope type on this mesh, different "
+                        "numbers of dofs")
                 dofs_per_stratum.append(counts[0])
             elif len(set(counts.values())) == 1:
                 # The dimension splits, but the element gives every entity of it

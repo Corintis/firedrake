@@ -177,6 +177,55 @@ def test_prism_dm_cell_type(meshname):
     assert mesh.topology.dm_cell_types == (PETSc.DM.PolytopeType.TRI_PRISM,)
 
 
+# ---------------------------------------------------------- element families
+
+@pytest.mark.parametrize("family, degree", [("HDiv Trace", 0), ("Bernstein", 1),
+                                            ("DG L2", 1)])
+def test_prism_unsupported_family_is_rejected(family, degree):
+    """A family that the prism tensor product does not build correctly fails.
+
+    Before the check, "HDiv Trace" 0 built a space with dimension 0 and no
+    error: the product puts its dofs on the base edges, not on the facets.
+    """
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    with pytest.raises(NotImplementedError, match="not supported on an unstructured prism"):
+        FunctionSpace(mesh, family, degree)
+
+
+def test_prism_supported_families_build():
+    """CG, DG and Real on prism_slab.msh, which has 52 cells and 60 vertices."""
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    assert FunctionSpace(mesh, "CG", 1).dim() == 60
+    assert FunctionSpace(mesh, "DG", 0).dim() == 52
+    assert FunctionSpace(mesh, "DG", 1).dim() == 6 * 52
+    R = FunctionSpace(mesh, "R", 0)
+    assert R.dim() == 1
+    assert np.isclose(assemble(Function(R).assign(2.0) * dx(domain=mesh)),
+                      2.0 * assemble(Constant(1.0) * dx(domain=mesh)), rtol=0, atol=1e-12)
+
+
+def test_prism_dof_count_that_changes_inside_one_polytope_type_is_rejected():
+    """The numbering stops on an element whose edges carry different dof counts.
+
+    The edges of a prism mesh have one polytope type, so they are one stratum
+    with one dof count. The product of two "HDiv Trace" 0 elements has no dof
+    on the base edges and one dof on each other edge. Built here directly, so
+    that the FInAT check of the family does not stop it first. Before the
+    check, the numbering took the count of edge 0 and dropped all 6 dofs.
+    """
+    import finat
+    import finat.ufl
+    import ufl
+    from finat.element_factory import create_element, prism_tpc
+
+    element = finat.FlattenedDimensions(create_element(finat.ufl.TensorProductElement(
+        finat.ufl.FiniteElement("HDiv Trace", ufl.triangle, 0),
+        finat.ufl.FiniteElement("HDiv Trace", ufl.interval, 0), cell=prism_tpc)))
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    with pytest.raises(NotImplementedError, match="different numbers of dofs"):
+        mesh.topology.make_dofs_per_plex_entity(element.entity_dofs())
+
+
 # ----------------------------------------------------------- the cell closure
 
 def test_prism_cell_closure_is_a_permutation_of_the_plex_closure(meshname):
