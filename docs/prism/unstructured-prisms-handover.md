@@ -73,14 +73,25 @@ design document treated as small:
 - **Checkpoint LOAD was broken independently of any permutation question.**
   `DMPlexTopologyLoad` restores cones only, so PETSc infers cell types, and its
   default makes a 2-triangle/3-quadrilateral cell a `DM_POLYTOPE_TRI_PRISM_TENSOR`,
-  which Firedrake rejects. `dmcommon.relabel_tensor_prisms` corrects that
-  inference — a checkpoint carries the cones unchanged, so a loaded prism always
-  has `TRI_PRISM` cone order and the tensor type is a wrong answer to a question
-  the cones alone cannot settle. **The call must precede `labelsLoad`**, which
-  removes the "celltype" label but leaves the `mesh->cellTypes` cache that
-  `DMPlexGetCellType` reads first; a fix placed after it repairs the label and
-  leaves the cache stale — silently on an optimised PETSc, as `PETSC_ERR_PLIB` on a
-  debug build.
+  which Firedrake rejects. `dmcommon._relabel_tensor_prisms_from_checkpoint`
+  corrects that inference — a checkpoint carries the cones unchanged, so a loaded
+  prism always has `TRI_PRISM` cone order and the tensor type is a wrong answer to
+  a question the cones alone cannot settle. The name carries its precondition:
+  call it only on a dm a Firedrake checkpoint supplied.
+
+  **The call must precede `labelsLoad`.** `labelsLoad` restores the saved
+  "celltype" label, whose tensor stratum is empty, so a call placed after it does
+  nothing at all, and the stale `mesh->cellTypes` cache that `DMPlexGetCellType`
+  reads first survives. Measured by moving the call, on this optimised PETSc
+  build: PETSc returns the stale tensor type with no error, and the failure
+  surfaces only because Firedrake's `_ufl_cell` guard then rejects the tensor
+  prism with `NotImplementedError`. So the misplacement is loud in practice, but
+  it is Firedrake's guard that makes it loud, not PETSc — remove that guard and
+  the same misplacement would be silent.
+
+  The relabel costs one `DMPlexComputeCellTypes` pass over the chart on every
+  checkpoint load of every mesh type. No guard can avoid it, because testing for
+  the label computes it.
 
 Test meshes, all tracked in `prism_meshes/`:
 
