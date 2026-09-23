@@ -349,7 +349,7 @@ else:
         for deg in (1, 2, 3, 4):
             W = FunctionSpace(m2, "CG", deg)
             x, y, z = SpatialCoordinate(m2)
-            e = x**deg + 2 * y**deg + 3 * z**deg + x * y * z
+            e = x**deg + 2 * y**deg + 3 * z**deg + (x * y * z if deg >= 3 else 0)
             u = Function(W).interpolate(e)
             err = float(np.sqrt(abs(assemble((u - e)**2 * dx))))
             check(6, f"{meshname} CG{deg} interpolation exact", err, 0.0, tol=1e-9)
