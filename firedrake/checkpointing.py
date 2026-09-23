@@ -1373,9 +1373,9 @@ class CheckpointFile:
         plex.distributionSetName(None)
         # topologyLoad restores the cones alone, so PETSc infers the cell types.
         # It gives a prism the tensor type, which Firedrake never writes.
-        # This must run before labelsLoad, which leaves the cell type cache of
-        # the plex stale. See the docstring of relabel_tensor_prisms.
-        dmcommon.relabel_tensor_prisms(plex)
+        # This must run before labelsLoad: after it, the call does nothing.
+        # See the docstring of _relabel_tensor_prisms_from_checkpoint.
+        dmcommon._relabel_tensor_prisms_from_checkpoint(plex)
         plex.labelsLoad(self.viewer, sfXB)
         self.viewer.popFormat()
         # These labels are distribution dependent.

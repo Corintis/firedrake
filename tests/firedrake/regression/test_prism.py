@@ -1359,7 +1359,8 @@ def test_hexahedron_plex_dg_coordinates_are_in_closure_order():
 # quadrilaterals is either a DM_POLYTOPE_TRI_PRISM or a
 # DM_POLYTOPE_TRI_PRISM_TENSOR, and the PETSc default picks the tensor type,
 # which Firedrake does not support. firedrake/checkpointing.py calls
-# dmcommon.relabel_tensor_prisms after topologyLoad to correct that.
+# dmcommon._relabel_tensor_prisms_from_checkpoint after topologyLoad to correct
+# that.
 #
 # CAUTION. These tests cover prism checkpointing. They are NOT evidence about
 # the PETSc DG1 permutation, and no review may cite them as such. A round trip
@@ -1456,23 +1457,23 @@ def test_prism_checkpoint_round_trips_cg2_in_parallel(tmp_path):
     _assert_checkpoint_round_trip(tmp_path, "prism_slab.msh", 2)
 
 
-def test_relabel_tensor_prisms_leaves_a_prism_mesh_alone(meshname):
+def test_relabel_tensor_prisms_from_checkpoint_leaves_a_prism_mesh_alone(meshname):
     from firedrake.cython import dmcommon
 
     mesh = Mesh(str(MESHDIR / meshname))
     dm = mesh.topology_dm
-    dmcommon.relabel_tensor_prisms(dm)
+    dmcommon._relabel_tensor_prisms_from_checkpoint(dm)
     cStart, cEnd = dm.getHeightStratum(0)
     for c in range(cStart, cEnd):
         assert dm.getCellType(c) == PETSc.DM.PolytopeType.TRI_PRISM
 
 
-def test_relabel_tensor_prisms_leaves_a_hexahedral_mesh_alone():
+def test_relabel_tensor_prisms_from_checkpoint_leaves_a_hexahedral_mesh_alone():
     from firedrake.cython import dmcommon
 
     mesh = UnitCubeMesh(1, 1, 1, hexahedral=True)
     dm = mesh.topology_dm
-    dmcommon.relabel_tensor_prisms(dm)
+    dmcommon._relabel_tensor_prisms_from_checkpoint(dm)
     cStart, cEnd = dm.getHeightStratum(0)
     for c in range(cStart, cEnd):
         assert dm.getCellType(c) == PETSc.DM.PolytopeType.HEXAHEDRON

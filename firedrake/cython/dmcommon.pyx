@@ -4577,7 +4577,7 @@ def get_dm_cell_types(PETSc.DM dm):
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-def relabel_tensor_prisms(PETSc.DM dm):
+def _relabel_tensor_prisms_from_checkpoint(PETSc.DM dm):
     """Relabel every DM_POLYTOPE_TRI_PRISM_TENSOR cell as DM_POLYTOPE_TRI_PRISM.
 
     Parameters
@@ -4604,15 +4604,28 @@ def relabel_tensor_prisms(PETSc.DM dm):
     answer to a question that the cones alone cannot settle. Call this on a dm
     that a checkpoint supplies, not on a dm of unknown origin.
 
-    Caution. Call this BEFORE ``DMPlexLabelsLoad``, not after. A checkpoint
-    holds the cell type label, and the load of it calls ``DMRemoveLabel``, which
-    clears the label but leaves the cell type cache of the dm, the
-    ``cellTypes`` array that ``DMPlexGetCellType`` reads first. So a load leaves
-    a correct label and a cache that still holds the inferred tensor type. A
-    PETSc build with debugging then raises PETSC_ERR_PLIB on the first
+    Caution. Call this BEFORE ``DMPlexLabelsLoad``, not after. After it, this
+    function does nothing at all. A checkpoint holds the cell type label, and
+    the load of it calls ``DMRemoveLabel``, which clears the label but leaves
+    the cell type cache of the dm, the ``cellTypes`` array that
+    ``DMPlexGetCellType`` reads first. The load then restores the saved label,
+    whose tensor stratum is empty. So this function finds no tensor cell and
+    returns, and the cache still holds the inferred tensor type. A PETSc build
+    with debugging then raises PETSC_ERR_PLIB on the first
     ``DMPlexGetCellType``, and a build without debugging returns the tensor type
-    in silence. ``DMPlexSetCellType`` writes both the label and the cache, so
+    in silence. The guard of ``_ufl_cell`` then rejects the loaded mesh with a
+    NotImplementedError. ``DMPlexSetCellType`` writes both the label and the cache, so
     this function keeps the two in step when it runs first.
+
+    The name says that the dm must come from a Firedrake checkpoint. No check
+    on the dm can confirm this, because the cones cannot tell the two types
+    apart.
+
+    Cost. ``DMPlexGetCellTypeLabel`` runs ``DMPlexComputeCellTypes`` over the
+    whole chart, because the dm holds no cell type yet. This occurs on each
+    checkpoint load of each mesh type, before the early return, so the early
+    return does not prevent it. petsc4py gives no test for the label that does
+    not compute it, so no guard can prevent the cost.
 
     This function is collective, because it reads the cell type label.
 
