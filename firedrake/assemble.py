@@ -12,7 +12,7 @@ import firedrake
 import numpy
 from pyadjoint.tape import annotate_tape
 from tsfc import kernel_args
-from tsfc.kernel_interface.common import shape_facet_types
+from tsfc.kernel_interface.common import shape_facet_types, interior_shape_facet_types
 from finat.element_factory import create_element
 from tsfc.ufl_utils import extract_firedrake_constants
 import ufl
@@ -1475,7 +1475,9 @@ class ExplicitMatrixAssembler(ParloopFormAssembler):
          "exterior_facet_tri": op2.ALL,
          "exterior_facet_quad": op2.ALL,
          "interior_facet": op2.ALL,
-         "interior_facet_vert": op2.ALL}
+         "interior_facet_vert": op2.ALL,
+         "interior_facet_tri": op2.ALL,
+         "interior_facet_quad": op2.ALL}
 
     @cached_property
     def _all_assemblers(self):
@@ -1750,7 +1752,7 @@ class _GlobalKernelBuilder:
         if not all(sd is None for sd in subdomain_data.get(_subdomain_data_integral_type(self._integral_type), [None])):
             return True
 
-        if self._integral_type in shape_facet_types:
+        if self._integral_type in shape_facet_types or self._integral_type in interior_shape_facet_types:
             # These iterate over the facets of one shape only.
             return True
         elif self._subdomain_id == "everywhere":
@@ -2177,11 +2179,18 @@ class ParloopBuilder:
 def _subdomain_data_integral_type(integral_type):
     """The integral type under which the form holds the subdomain data of a kernel.
 
-    compile_form splits an ``exterior_facet`` integral on a prism into the
-    types of ``shape_facet_types``, but the assembler holds the form from
-    before the split. Its subdomain data is under ``exterior_facet``.
+    compile_form splits an ``exterior_facet`` (``interior_facet``) integral on
+    a prism into the types of ``shape_facet_types``
+    (``interior_shape_facet_types``), but the assembler holds the form from
+    before the split. Its subdomain data is under ``exterior_facet``
+    (``interior_facet``).
     """
-    return "exterior_facet" if integral_type in shape_facet_types else integral_type
+    if integral_type in shape_facet_types:
+        return "exterior_facet"
+    elif integral_type in interior_shape_facet_types:
+        return "interior_facet"
+    else:
+        return integral_type
 
 
 @functools.singledispatch
@@ -2276,6 +2285,9 @@ def _as_parloop_arg_interior_facet(_, self):
     else:
         m, integral_type = mesh.topology.trans_mesh_entity_map(self._mesh.topology, self._integral_type, self._subdomain_id, self._all_integer_subdomain_ids)
         assert integral_type == "interior_facet"
+    if self._integral_type in interior_shape_facet_types:
+        # The kernel selects the facet by its position within its shape group.
+        return op2.DatParloopArg(mesh.interior_facets.shape_local_facet_dat, m)
     return op2.DatParloopArg(mesh.interior_facets.local_facet_dat, m)
 
 

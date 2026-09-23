@@ -17,7 +17,7 @@ from tsfc import compile_form as original_tsfc_compile_form
 from tsfc.parameters import PARAMETERS as tsfc_default_parameters
 from tsfc.ufl_utils import extract_firedrake_constants
 from tsfc.kernel_interface.firedrake_loopy import ActiveDomainNumbers
-from tsfc.kernel_interface.common import shape_facet_types
+from tsfc.kernel_interface.common import shape_facet_types, interior_shape_facet_types
 
 from pyop2 import op2
 from pyop2.caching import memory_and_disk_cache, default_parallel_hashkey
@@ -269,34 +269,39 @@ def compile_form(form, name, parameters=None, split=True, dont_split=(), diagona
 
 
 def _split_facet_integrals_by_shape(form, parameters):
-    """Split each exterior facet integral on a cell with more than one facet shape.
+    """Split each facet integral on a cell with more than one facet shape.
 
     A prism has quadrilateral and triangular facets. TSFC compiles one kernel
     per facet shape, so replace each ``exterior_facet`` integral on such a cell
-    with one integral of each type in ``shape_facet_types``. The integrals keep
-    their subdomain id; the mesh intersects the subdomain with the facet shape.
-    Integrals on every other cell are returned unchanged.
+    with one integral of each type in ``shape_facet_types``, and each
+    ``interior_facet`` integral with one integral of each type in
+    ``interior_shape_facet_types``. The integrals keep their subdomain id; the
+    mesh intersects the subdomain with the facet shape. Integrals on every
+    other cell are returned unchanged.
 
     The two integrals get the same metadata. A ``QuadratureRule`` object is
     for one reference facet only, so the other facet shape would use it too
     and give a wrong answer. Such a rule raises ``NotImplementedError``.
     """
+    split_types = {"exterior_facet": ("exterior facet integral (ds)", shape_facet_types),
+                   "interior_facet": ("interior facet integral (dS)", interior_shape_facet_types)}
     integrals = []
     for integral in form.integrals():
         cell = integral.ufl_domain().ufl_cell()
-        if (integral.integral_type() == "exterior_facet"
+        if (integral.integral_type() in split_types
                 and isinstance(cell, ufl.Cell) and len(cell.facet_types) > 1):
+            name, types = split_types[integral.integral_type()]
             # The integral metadata overrides the form compiler parameters,
             # as in tsfc.driver.
             rule = {**parameters, **integral.metadata()}.get("quadrature_rule")
             if rule is not None and not isinstance(rule, str):
                 raise NotImplementedError(
-                    f"A QuadratureRule object is not supported for an exterior facet "
-                    f"integral (ds) on a {cell.cellname} mesh, because its facets "
+                    f"A QuadratureRule object is not supported for an {name} "
+                    f"on a {cell.cellname} mesh, because its facets "
                     f"have more than one shape and a rule is for one shape only. "
                     f"Use 'quadrature_degree' or a scheme name instead.")
             integrals.extend(integral.reconstruct(integral_type=integral_type)
-                             for integral_type in sorted(shape_facet_types))
+                             for integral_type in sorted(types))
         else:
             integrals.append(integral)
     if len(integrals) == len(form.integrals()):

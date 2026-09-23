@@ -793,6 +793,8 @@ class FunctionSpace:
             self_map = self.exterior_facet_node_map()
         elif target_integral_type == "interior_facet":
             self_map = self.interior_facet_node_map()
+        elif target_integral_type in ("interior_facet_tri", "interior_facet_quad"):
+            self_map = self.interior_facet_node_map()
         elif target_integral_type == "interior_facet_vert":
             self_map = self.interior_facet_node_map()
         else:
