@@ -13,6 +13,7 @@ import gem.impero_utils as impero_utils
 import petsctools
 import numpy
 import ufl
+import ufl.algorithms.apply_restrictions
 from FIAT.reference_element import TensorProductCell, QUADRILATERAL, TRIANGLE
 from finat.cell_tools import max_complex
 from finat.quadrature import AbstractQuadratureRule
