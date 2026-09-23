@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Generate the gmsh prism meshes for the Firedrake prism tests.
 
-Produces nine files in this directory:
+Produces fourteen files in this directory:
 
   prism_reference.msh one prism whose vertices are the FIAT reference prism.
                    Written by hand, because gmsh will not place a single prism
@@ -35,7 +35,20 @@ Produces nine files in this directory:
                    from the theoretical one. The warp of prism_warped.msh is
                    applied to every level, so no prism is affine.
 
-Physical groups of every file but the two below:
+  prism_interior_marked.msh
+                   two boxes, x < 0 and x > 0, each extruded in two stages,
+                   so the mesh has a marked interior surface of each facet
+                   shape. For the interior facet integral (dS) tests.
+
+  prism_interior_marked_scrambled.msh, prism_warped_scrambled.msh,
+  prism_order_r0_scrambled.msh, prism_order_r1_scrambled.msh,
+  prism_order_r2_scrambled.msh
+                   a copy of the mesh without the suffix, with the node list
+                   of each prism changed by one of the 6 orientation-preserving
+                   prism symmetries. See scramble below. The geometry and the
+                   physical groups do not change.
+
+Physical groups of every file but the three below:
   volume 1        the prism cells
   surface 1       bottom (z = 0),  triangular facets
   surface 2       top    (z = H),  triangular facets
@@ -56,9 +69,18 @@ Physical groups of prism_reference_marked.msh:
   surface 4       x = 0,     quadrilateral, area 1
   surface 5       x + y = 1, quadrilateral, area sqrt(2)
 
+Physical groups of prism_interior_marked.msh, the box [-0.5, 0.5]^2 x [0, 1]:
+  volume 1        the prism cells
+  surface 1       bottom (z = 0),  triangular facets
+  surface 10      the interior plane z = 0.5, 136 triangular facets, area 1
+  surface 20      the interior plane x = 0, 42 quadrilateral facets, area 1
+  surface 30      surfaces 10 and 20 together, both facet shapes, area 2
+
 Run:  python tests/firedrake/meshes/prism/make_prism_mesh.py
 """
 import os
+import random
+
 import numpy as np
 import gmsh
 
@@ -141,6 +163,118 @@ def build(path, warp, divisions=None, nlayers=NLAYERS, mixed_marker=False):
     return ntypes
 
 
+def build_interior_marked(path):
+    """Write prism_interior_marked.msh: two boxes with marked interior surfaces.
+
+    Each box is a half of the unit square, extruded to z = 0.5 and then again
+    to z = 1. The first extrusion leaves the triangles of z = 0.5 inside the
+    mesh, and the shared side x = 0 leaves quadrilaterals inside the mesh.
+    """
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Terminal", 0)
+    gmsh.model.add("interior")
+    geo = gmsh.model.geo
+    points = {xy: geo.addPoint(*xy, 0, 0.15)
+              for xy in ((-.5, -.5), (0, -.5), (.5, -.5), (.5, .5), (0, .5), (-.5, .5))}
+
+    def line(a, b):
+        return geo.addLine(points[a], points[b])
+
+    mid = line((0, -.5), (0, .5))
+    s1 = geo.addPlaneSurface([geo.addCurveLoop(
+        [line((-.5, -.5), (0, -.5)), mid, line((0, .5), (-.5, .5)), line((-.5, .5), (-.5, -.5))])])
+    s2 = geo.addPlaneSurface([geo.addCurveLoop(
+        [line((0, -.5), (.5, -.5)), line((.5, -.5), (.5, .5)), line((.5, .5), (0, .5)), -mid])])
+    vols, mids, walls = [], [], []
+    for s in (s1, s2):
+        # recombine=True gives prisms; see build.
+        e1 = geo.extrude([(2, s)], 0, 0, .5, numElements=[3], recombine=True)
+        e2 = geo.extrude([e1[0]], 0, 0, .5, numElements=[3], recombine=True)
+        vols += [e1[1][1], e2[1][1]]
+        mids.append(e1[0][1])
+    geo.synchronize()
+    # The surfaces extruded from the line x = 0 are the surfaces whose
+    # bounding box has x = 0 at both ends.
+    for dim, tag in gmsh.model.getEntities(2):
+        b = gmsh.model.getBoundingBox(dim, tag)
+        if abs(b[0]) < 1e-9 and abs(b[3]) < 1e-9:
+            walls.append(tag)
+    gmsh.model.addPhysicalGroup(3, vols, 1)
+    gmsh.model.addPhysicalGroup(2, sorted(set(mids)), 10)
+    gmsh.model.addPhysicalGroup(2, sorted(set(walls)), 20)
+    gmsh.model.addPhysicalGroup(2, sorted(set(mids)) + sorted(set(walls)), 30)
+    gmsh.model.addPhysicalGroup(2, [s1, s2], 1)
+    gmsh.model.mesh.removeDuplicateNodes()
+    gmsh.model.mesh.generate(3)
+    gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
+    gmsh.write(path)
+
+    ntypes = {}
+    for dim, tag in gmsh.model.getEntities(3):
+        et, etags, _ = gmsh.model.mesh.getElements(dim, tag)
+        for t, tags in zip(et, etags):
+            ntypes[int(t)] = ntypes.get(int(t), 0) + len(tags)
+    gmsh.finalize()
+    return ntypes
+
+
+# The 6 orientation-preserving symmetries of the gmsh prism node order: the
+# 3 rotations of the triangle, each with or without the exchange of the two
+# bases. The exchange also reflects the triangle, so the handedness of the
+# cell does not change.
+PRISM_ROTATIONS = ((0, 1, 2, 3, 4, 5), (1, 2, 0, 4, 5, 3), (2, 0, 1, 5, 3, 4))
+PRISM_FLIP = (3, 5, 4, 0, 2, 1)
+PRISM_SYMMETRIES = tuple(s for r in PRISM_ROTATIONS
+                         for s in (r, tuple(r[PRISM_FLIP[i]] for i in range(6))))
+
+# The mesh to scramble, and the seed, of each scrambled mesh.
+SCRAMBLED = (("prism_interior_marked.msh", 2), ("prism_warped.msh", 1),
+             ("prism_order_r0.msh", 10), ("prism_order_r1.msh", 11),
+             ("prism_order_r2.msh", 12))
+
+
+def scramble(src, dst, seed):
+    """Write a copy of a gmsh 2.2 prism mesh with each prism's node list permuted.
+
+    :arg src: The path of the mesh to copy.
+    :arg dst: The path of the copy.
+    :arg seed: The seed of the random choice. The same seed gives the same file.
+
+    Each prism gets one of PRISM_SYMMETRIES, at random. The geometry does not
+    change, but the plex cones do, so the cells present their shared facets
+    in many orientations. gmsh gives the z-aligned meshes the same orientation
+    on the two sides of every triangular facet, and a missing point
+    permutation on those facets then gives no error. The surface elements do
+    not change.
+    """
+    rng = random.Random(seed)
+    lines = open(src).read().splitlines()
+    out = []
+    i = 0
+    in_elements = False
+    while i < len(lines):
+        line = lines[i]
+        if line == "$Elements":
+            in_elements = True
+            out += [line, lines[i + 1]]
+            i += 2
+            continue
+        if line == "$EndElements":
+            in_elements = False
+        if in_elements:
+            fields = line.split()
+            # fields: id, type, ntags, tags..., node tags. Type 6 is the 6-node prism.
+            if fields[1] == "6":
+                ntags = int(fields[2])
+                head, nodes = fields[:3 + ntags], fields[3 + ntags:]
+                symmetry = rng.choice(PRISM_SYMMETRIES)
+                line = " ".join(head + [nodes[symmetry[k]] for k in range(6)])
+        out.append(line)
+        i += 1
+    with open(dst, "w") as fh:
+        fh.write("\n".join(out) + "\n")
+
+
 # gmsh node order for a 6-node prism: bottom triangle, then top triangle.
 # These six points are the FIAT reference prism, reordered into that convention.
 REFERENCE_MSH = """$MeshFormat
@@ -214,6 +348,15 @@ if __name__ == "__main__":
         kind = f"{types[6]} prisms (gmsh type 6), no other cell type" \
             if set(types) == {6} else f"WRONG: {types}"
         print(f"{name:<20} 3D element types: {kind}")
+    name = "prism_interior_marked.msh"
+    types = build_interior_marked(os.path.join(HERE, name))
+    kind = f"{types[6]} prisms (gmsh type 6), no other cell type" \
+        if set(types) == {6} else f"WRONG: {types}"
+    print(f"{name:<20} 3D element types: {kind}")
+    for name, seed in SCRAMBLED:
+        scrambled = name.replace(".msh", "_scrambled.msh")
+        scramble(os.path.join(HERE, name), os.path.join(HERE, scrambled), seed)
+        print(f"{scrambled:<20} a scrambled copy of {name}, seed {seed}")
     print("\nA pure-prism file matters. PETSc rewrites the cell type to")
     print("DM_POLYTOPE_TRI_PRISM_TENSOR when a file holds tetrahedra AND prisms")
     print("(see petsc/src/dm/impls/plex/plexgmsh.c:1755). That variant uses a")

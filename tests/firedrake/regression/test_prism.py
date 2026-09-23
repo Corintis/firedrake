@@ -2,8 +2,8 @@
 
 The meshes come from ``tests/firedrake/meshes/prism/``. They hold
 ``DM_POLYTOPE_TRI_PRISM`` cells, which is the only prism cell type that this
-code supports. Exterior facet integrals (``ds``) are tested at the end of the
-file. Interior facet integrals (``dS``) are not supported on a prism.
+code supports. Exterior facet integrals (``ds``) and interior facet integrals
+(``dS``) are tested at the end of the file.
 
 Two gaps stopped a prism mesh above degree 1. Both are closed.
 
@@ -44,8 +44,9 @@ from firedrake import (CellDiameter, Constant, DirichletBC, ExtrudedMesh,
                        TrialFunction, TrialFunctions, UnitCubeMesh,
                        UnitSquareMesh, VectorFunctionSpace,
                        VertexOnlyMeshMissingPointsError, VTKFile, as_vector,
-                       assemble, cos, dS, div, dot, ds, ds_b, ds_t, ds_v, dx,
-                       exp, grad, inner, pi, sin, solve)
+                       assemble, avg, conditional, cos, dS, div, dot, ds, ds_b,
+                       ds_t, ds_v, dx, exp, grad, gt, inner, jump, pi, sin,
+                       solve)
 from firedrake.petsc import PETSc
 
 
@@ -2256,13 +2257,6 @@ def test_prism_slate_facet_integral_is_rejected():
         assemble(Tensor(inner(u, v) * ds(domain=mesh)))
 
 
-def test_prism_interior_facet_integral_is_rejected():
-    """dS on a prism is out of scope, and fails with a message, not a number."""
-    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
-    with pytest.raises(NotImplementedError, match="not supported on prism meshes"):
-        assemble(Constant(1.0) * dS(domain=mesh))
-
-
 @pytest.mark.parametrize("facet", ["triangle", "quadrilateral"])
 def test_prism_ds_with_a_quadrature_rule_object_is_rejected(facet):
     """A QuadratureRule object is for one facet shape, so a prism ds rejects it.
@@ -2569,3 +2563,562 @@ def test_prism_boundary_condition_converges_at_the_expected_order(condition, deg
         # collapsed into round-off instead of converging.
         assert degree + 1 - 0.3 < l2_order < degree + 1 + 0.5, (l2_order, steps)
         assert degree - 0.3 < h1_order < degree + 0.5, (h1_order, steps)
+
+
+# ------------------------------------------------- interior facet integrals, dS
+#
+# compile_form splits a prism dS into one interior_facet_tri and one
+# interior_facet_quad kernel, as it splits a ds. An interior facet has two
+# sides, and each side maps the reference facet points through its own cell.
+# The two lists of physical points must be in the same order. On a prism the
+# closure keeps the plex cone order, so the two cells can see a shared facet
+# in different orientations, and each side permutes its points into the order
+# of the plex cone of the facet.
+#
+# Three rules decide which tests can detect an error in that order:
+#
+# 1. A value that is constant along a facet cannot. An area, the normal of a
+#    flat facet, FacetArea and DG0 data do not change when the points move.
+# 2. A form that reads one side only cannot. It moves the points and the
+#    weights of that side together. Only a product of a '+' value and a '-'
+#    value can.
+# 3. A field that is constant along the facets of one shape hides that shape.
+#
+# gmsh gives both sides of every triangular facet of a z-aligned mesh the
+# same orientation, so a missing permutation on the triangles gives the right
+# answer on those meshes. The *_scrambled.msh meshes permute the node list of
+# each prism, and test_prism_dS_scrambled_mesh_presents_every_orientation
+# makes sure that they stay scrambled.
+#
+# The '+' cell of a facet on a partition boundary can change with the number
+# of processes. So every parallel test below is symmetric in '+' and '-'.
+
+INTERIOR_MESHNAME = "prism_interior_marked.msh"
+SCRAMBLED_INTERIOR_MESHNAME = "prism_interior_marked_scrambled.msh"
+INTERIOR_MESHNAMES = (INTERIOR_MESHNAME, SCRAMBLED_INTERIOR_MESHNAME)
+SCRAMBLED_MESHNAMES = (SCRAMBLED_INTERIOR_MESHNAME, "prism_warped_scrambled.msh",
+                       "prism_order_r0_scrambled.msh", "prism_order_r1_scrambled.msh",
+                       "prism_order_r2_scrambled.msh")
+SCRAMBLED_ORDER_MESHNAMES = SCRAMBLED_MESHNAMES[2:]
+
+# The marked interior surfaces of prism_interior_marked.msh. Marker 10 is the
+# plane z = 0.5 and holds triangles only. Marker 20 is the plane x = 0 and
+# holds quadrilaterals only. Marker 30 is the two together.
+INTERIOR_MARKER_AREAS = {10: 1.0, 20: 1.0, 30: 2.0}
+
+
+def _plane_distance(mesh, marker):
+    """The signed distance from the marked plane, positive on one side."""
+    x, y, z = SpatialCoordinate(mesh)
+    return {10: z - 0.5, 20: x}[marker]
+
+
+def _read_gmsh22_interior_facets(path):
+    """Read the interior facets of a gmsh 2.2 ASCII prism file.
+
+    :arg path: The path of the .msh file.
+    :returns: A pair (areas, marked). areas is an array with the area of each
+        facet that two prisms share. marked maps each physical group of the
+        surface elements to an array of the areas of its facets that two
+        prisms share.
+
+    This is independent of Firedrake. It is correct for planar facets only:
+    the area is the norm of half the sum of the cross products of
+    consecutive vertices.
+    """
+    coords, cells = _read_gmsh22_prisms(path)
+
+    def area(vertices):
+        points = coords[list(vertices)]
+        return np.linalg.norm(0.5 * sum(np.cross(points[k], points[(k + 1) % len(points)])
+                                        for k in range(len(points))))
+
+    faces = {}
+    for cell in cells:
+        for face in ((0, 1, 2), (3, 4, 5), (0, 1, 4, 3), (1, 2, 5, 4), (2, 0, 3, 5)):
+            vertices = tuple(cell[list(face)])
+            faces.setdefault(frozenset(vertices), [vertices, 0])[1] += 1
+    interior = {key: vertices for key, (vertices, count) in faces.items() if count == 2}
+    lines = Path(path).read_text().split("\n")
+    tag_to_row = {}
+    i = lines.index("$Nodes")
+    for row in range(int(lines[i + 1])):
+        tag_to_row[int(lines[i + 2 + row].split()[0])] = row
+    j = lines.index("$Elements")
+    marked = {}
+    for row in range(int(lines[j + 1])):
+        fields = [int(x) for x in lines[j + 2 + row].split()]
+        # Type 2 is the 3-node triangle, type 3 the 4-node quadrilateral.
+        if fields[1] not in (2, 3):
+            continue
+        ntags = fields[2]
+        vertices = [tag_to_row[t] for t in fields[3 + ntags:]]
+        if frozenset(vertices) in interior:
+            marked.setdefault(fields[3], []).append(area(vertices))
+    areas = np.array([area(vertices) for vertices in interior.values()])
+    return areas, {marker: np.array(values) for marker, values in marked.items()}
+
+
+def _point_mismatch(mesh, measure):
+    """The integral of the squared distance between the two sides' points."""
+    x = SpatialCoordinate(mesh)
+    return assemble(inner(x('+') - x('-'), x('+') - x('-')) * measure)
+
+
+def _sipg_terms(V, alpha):
+    """The symmetric interior penalty terms of a DG Laplacian.
+
+    :arg V: The DG function space.
+    :arg alpha: The penalty coefficient. The penalty is alpha / h, with h the
+        cell diameter.
+    :returns: A tuple (u, v, interior, boundary). interior is the integrand on
+        the interior facets, and boundary the Nitsche integrand on the
+        exterior facets, for a Dirichlet condition u = 0.
+    """
+    mesh = V.mesh()
+    u, v = TrialFunction(V), TestFunction(V)
+    n = FacetNormal(mesh)
+    h = CellDiameter(mesh)
+    interior = (-inner(avg(grad(u)), jump(v, n)) - inner(jump(u, n), avg(grad(v)))
+                + alpha / avg(h) * inner(jump(u, n), jump(v, n)))
+    boundary = (-inner(grad(u), n) * v - inner(grad(v), n) * u + alpha / h * u * v)
+    return u, v, interior, boundary
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("meshname", INTERIOR_MESHNAMES)
+def test_prism_dS_measures_each_marked_surface(meshname):
+    """The area of each marked interior surface, and of all interior facets.
+
+    Marker 10 holds triangles only, so a triangle kernel that gets the FIAT
+    facet number in place of the position in [3, 4] measures zero here.
+    Markers 30 and (10, 20) hold both shapes. dS + dS(10) makes an
+    "otherwise" kernel for the facets outside marker 10.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    areas, _ = _read_gmsh22_interior_facets(MESHDIR / meshname)
+    got = {marker: assemble(Constant(1.0) * dS(marker, domain=mesh))
+           for marker in INTERIOR_MARKER_AREAS}
+    both = assemble(Constant(1.0) * dS((10, 20), domain=mesh))
+    total = assemble(Constant(1.0) * dS(domain=mesh))
+    otherwise = assemble(Constant(1.0) * dS(domain=mesh) + Constant(1.0) * dS(10, domain=mesh))
+    for marker, area in INTERIOR_MARKER_AREAS.items():
+        assert np.isclose(got[marker], area, rtol=0, atol=1e-12), f"marker {marker}"
+    assert np.isclose(both, 2.0, rtol=0, atol=1e-12)
+    assert np.isclose(total, areas.sum(), rtol=0, atol=1e-12)
+    assert np.isclose(otherwise, areas.sum() + 1.0, rtol=0, atol=1e-12)
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("meshname", SCRAMBLED_MESHNAMES + ("prism_two_perpendicular.msh",))
+def test_prism_dS_points_of_the_two_sides_agree(meshname):
+    """|x('+') - x('-')|^2 over the interior facets is zero.
+
+    Each side maps its own facet quadrature points to physical space. The
+    integral is zero only if the two lists are in the same order, so this
+    catches an error in the point permutation of either side. On
+    prism_interior_marked_scrambled.msh it is measured for each facet shape
+    too. prism_two_perpendicular.msh is the only mesh whose cells see a
+    shared quadrilateral facet with different extrinsic orientations.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    got = {"all": _point_mismatch(mesh, dS(domain=mesh))}
+    if meshname == SCRAMBLED_INTERIOR_MESHNAME:
+        got.update({marker: _point_mismatch(mesh, dS(marker, domain=mesh))
+                    for marker in (10, 20)})
+    for key, value in got.items():
+        assert abs(value) < 1e-26, f"{key}: {value}"
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("degree", [2, 3, 4])
+@pytest.mark.parametrize("meshname", [SCRAMBLED_INTERIOR_MESHNAME, "prism_warped_scrambled.msh",
+                                      "prism_two_perpendicular.msh"])
+def test_prism_dS_jump_of_a_continuous_function_is_zero(meshname, degree):
+    """jump(u)^2 over the interior facets is zero for u in CG of degree k.
+
+    u is the interpolant of a smooth function that changes along every
+    facet, so a point order error or a facet dof order error moves the value.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    x, y, z = SpatialCoordinate(mesh)
+    u = Function(FunctionSpace(mesh, "CG", degree))
+    u.interpolate(sin(3 * x) * cos(2 * y) * exp(z))
+    got = assemble(jump(u)**2 * dS(domain=mesh))
+    assert abs(got) < 1e-20, got
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("degree", [1, 2, 3])
+def test_prism_dS_discontinuous_interpolant_of_a_polynomial(degree):
+    """The traces of u = I p in DG of degree k agree with p, on each facet shape.
+
+    p has total degree k, so it is in the space, and the two traces of u are
+    equal to p on every interior facet. p changes along the facets of both
+    markers, so the tests on marker 10 (triangles) and marker 20
+    (quadrilaterals) see a point order error on each shape.
+    """
+    mesh = Mesh(str(MESHDIR / SCRAMBLED_INTERIOR_MESHNAME))
+    p = _total_degree_exact(mesh, degree)
+    u = Function(FunctionSpace(mesh, "DG", degree)).interpolate(p)
+    got = {}
+    for marker in (10, 20):
+        got[f"avg, marker {marker}"] = assemble((avg(u) - p('+'))**2 * dS(marker, domain=mesh))
+        got[f"jump, marker {marker}"] = assemble(jump(u)**2 * dS(marker, domain=mesh))
+    got["jump, all"] = assemble(jump(u)**2 * dS(domain=mesh))
+    for key, value in got.items():
+        assert abs(value) < 1e-20, f"{key}: {value}"
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("meshname", [SCRAMBLED_INTERIOR_MESHNAME, "prism_warped_scrambled.msh",
+                                      "prism_two_perpendicular.msh"])
+def test_prism_dS_normals_of_the_two_sides_are_opposite(meshname):
+    """n('+') + n('-') is zero and n('+') has unit length on every interior facet.
+
+    The quadrilateral facets of prism_warped_scrambled.msh are not planar, so
+    there the normal changes along each facet and a point order error moves
+    the first integral too. A normal from the wrong facet of the cell moves
+    both.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    n = FacetNormal(mesh)
+    opposite = assemble(inner(n('+') + n('-'), n('+') + n('-')) * dS(domain=mesh))
+    unit = assemble(inner(n('+'), n('+')) * dS(domain=mesh))
+    area = assemble(Constant(1.0) * dS(domain=mesh))
+    assert abs(opposite) < 1e-24, opposite
+    assert np.isclose(unit, area, rtol=1e-13, atol=0)
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("meshname", INTERIOR_MESHNAMES)
+def test_prism_dS_normal_of_each_marked_plane(meshname):
+    """The normal of the plane z = 0.5 is +-e_z, and of the plane x = 0 is +-e_x.
+
+    The square makes the value independent of the side that is '+'.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    n = FacetNormal(mesh)
+    got = {10: assemble(n('+')[2]**2 * dS(10, domain=mesh)),
+           20: assemble(n('+')[0]**2 * dS(20, domain=mesh))}
+    for marker, value in got.items():
+        assert np.isclose(value, INTERIOR_MARKER_AREAS[marker], rtol=0, atol=1e-12), \
+            f"marker {marker}"
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("meshname", INTERIOR_MESHNAMES)
+def test_prism_dS_facet_area_on_each_shape(meshname):
+    """The integral of FacetArea over a set of facets is the sum of the squared areas."""
+    from firedrake import FacetArea
+
+    mesh = Mesh(str(MESHDIR / meshname))
+    areas, marked = _read_gmsh22_interior_facets(MESHDIR / meshname)
+    facet_area = FacetArea(mesh)
+    got = {marker: assemble(facet_area * dS(marker, domain=mesh))
+           for marker in INTERIOR_MARKER_AREAS}
+    total = assemble(facet_area * dS(domain=mesh))
+    for marker, value in got.items():
+        assert np.isclose(value, (marked[marker]**2).sum(), rtol=1e-13, atol=0), \
+            f"marker {marker}"
+    assert np.isclose(total, (areas**2).sum(), rtol=1e-13, atol=0)
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("degree", [1, 2, 3])
+@pytest.mark.parametrize("marker", [10, 20])
+@pytest.mark.parametrize("meshname", INTERIOR_MESHNAMES)
+def test_prism_dS_surface_source_is_exact(meshname, marker, degree):
+    """A source of strength 2 on a marked interior plane gives u = |s|.
+
+    s is the signed distance from the plane. -div(grad(u)) = 2 delta(s) with
+    u = |s| on the boundary has the solution |s|, which is in CG1 because the
+    plane is a union of facets.
+
+    This is the linear form path of a dS(marker), and it catches a wrong facet
+    position. It reads the '+' side only, so it is blind to the point order.
+    Do not count it as a test of the orientations.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    V = FunctionSpace(mesh, "CG", degree)
+    exact = abs(_plane_distance(mesh, marker))
+    u, v = TrialFunction(V), TestFunction(V)
+    uh = Function(V)
+    solve(inner(grad(u), grad(v)) * dx == -2.0 * v('+') * dS(marker, domain=mesh), uh,
+          bcs=DirichletBC(V, exact, "on_boundary"),
+          solver_parameters={"ksp_type": "preonly", "pc_type": "lu"})
+    error = _l2_error(uh, exact)
+    assert error < 1e-10, error
+
+
+def _contact_conductance_problem(mesh, degree, marker, hc=4.0):
+    """A DG Laplacian with a contact conductance on a marked interior plane.
+
+    :returns: A triple (a, L, exact). a has the SIPG terms on every interior
+        facet but the marked ones, and the contact conductance term
+        hc * jump(u, n) . jump(v, n) on the marked ones. UFL makes the first
+        an "otherwise" integral.
+
+    The exact solution is s + w below the plane (s < 0), and s + w + 1/hc
+    above it. w is linear and does not change with s, so the flux through the
+    plane is 1 on both sides and equals hc times the jump. w changes along the
+    plane, so a point order error on the marked facets moves the solution:
+    with w = 0 the solution is constant along the triangular facets of
+    marker 10, and a missing triangle permutation gives no error.
+    """
+    x, y, z = SpatialCoordinate(mesh)
+    s = _plane_distance(mesh, marker)
+    w = {10: 0.3 * (x - 2.0 * y), 20: 0.3 * (y - 2.0 * z)}[marker]
+    exact = s + w + conditional(gt(s, 0), 1.0 / hc, 0.0)
+    V = FunctionSpace(mesh, "DG", degree)
+    alpha = Constant(10.0 * (degree + 1)**2)
+    u, v, sipg, nitsche = _sipg_terms(V, alpha)
+    n = FacetNormal(mesh)
+    h = CellDiameter(mesh)
+    interface = hc * inner(jump(u, n), jump(v, n))
+    a = (inner(grad(u), grad(v)) * dx + sipg * dS(domain=mesh)
+         + (interface - sipg) * dS(marker, domain=mesh) + nitsche * ds(domain=mesh))
+    L = (-inner(grad(v), n) * exact + alpha / h * exact * v) * ds(domain=mesh)
+    return a, L, exact
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("degree", [1, 2])
+@pytest.mark.parametrize("marker", [10, 20])
+def test_prism_dS_contact_conductance_is_exact(marker, degree):
+    """SIPG with a contact conductance on marker 10 or 20 reproduces a piecewise linear solution.
+
+    This uses dS(marker) on each facet shape, the "otherwise" kernel, jump,
+    avg, FacetNormal and CellDiameter on both sides, and a DG solve.
+    """
+    mesh = Mesh(str(MESHDIR / SCRAMBLED_INTERIOR_MESHNAME))
+    a, L, exact = _contact_conductance_problem(mesh, degree, marker)
+    uh = Function(a.arguments()[0].function_space())
+    solve(a == L, uh, solver_parameters={"ksp_type": "preonly", "pc_type": "lu"})
+    error = _l2_error(uh, exact) / _l2_error(Constant(0.0), exact)
+    assert error < 1e-10, error
+
+
+@pytest.mark.parallel([1, 2, 3])
+def test_prism_dS_matrix_matches_the_action():
+    """The assembled DG2 matrix times a function equals the assembled action.
+
+    The matrix gets the four blocks of each interior facet, and the action
+    gets two vectors. Both use the same kernels, so a difference means that
+    the matrix puts a block into the wrong rows or columns.
+    """
+    from firedrake import action
+
+    mesh = Mesh(str(MESHDIR / SCRAMBLED_INTERIOR_MESHNAME))
+    a, _, _ = _contact_conductance_problem(mesh, 2, 20)
+    V = a.arguments()[0].function_space()
+    x, y, z = SpatialCoordinate(mesh)
+    w = Function(V).interpolate(sin(3 * x) * cos(2 * y) * exp(z))
+    A = assemble(a).petscmat
+    Aw = assemble(action(a, w))
+    with w.dat.vec_ro as wvec, Aw.dat.vec_ro as Awvec:
+        product = A.createVecLeft()
+        A.mult(wvec, product)
+        reference = Awvec.norm()
+        product.axpy(-1.0, Awvec)
+        difference = product.norm()
+    assert difference < 1e-12 * reference, (difference, reference)
+
+
+def _sipg_order_step(meshname, degree):
+    """Solve a DG Laplacian by SIPG for a non-polynomial solution on one mesh.
+
+    :returns: A triple (h, L2 error, broken H1 seminorm error). h is the
+        largest cell diameter of the mesh, over all the processes.
+
+    The Dirichlet condition is weak (Nitsche), so every facet of the mesh
+    carries a facet integral.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    x, y, z = SpatialCoordinate(mesh)
+    exact = sin(pi * x) * cos(pi * y) * exp(z)
+    V = FunctionSpace(mesh, "DG", degree)
+    alpha = Constant(10.0 * (degree + 1)**2)
+    u, v, sipg, nitsche = _sipg_terms(V, alpha)
+    n = FacetNormal(mesh)
+    h = CellDiameter(mesh)
+    a = inner(grad(u), grad(v)) * dx + sipg * dS(domain=mesh) + nitsche * ds(domain=mesh)
+    L = (-div(grad(exact)) * v * dx
+         + (-inner(grad(v), n) * exact + alpha / h * exact * v) * ds(domain=mesh))
+    uh = Function(V)
+    solve(a == L, uh, solver_parameters={"ksp_type": "preonly", "pc_type": "lu"})
+    e = uh - exact
+    l2 = float(np.sqrt(abs(assemble(inner(e, e) * dx))))
+    h1 = float(np.sqrt(abs(assemble(inner(grad(e), grad(e)) * dx))))
+    diameters = Function(FunctionSpace(mesh, "DG", 0))
+    diameters.interpolate(CellDiameter(mesh))
+    h = mesh.comm.allreduce(float(diameters.dat.data_ro.max(initial=0.0)),
+                            op=MPI.MAX)
+    return h, l2, h1
+
+
+@pytest.mark.parametrize("degree", [1, 2, 3])
+def test_prism_dS_sipg_converges_at_the_expected_order(degree):
+    """The SIPG L2 error falls as h^(k+1) and the broken H1 error as h^k.
+
+    The meshes are warped and scrambled, so no prism is affine and the cells
+    see their shared facets in every orientation. Every part of a prism dS
+    contributes to the error.
+
+    The test is serial only, as
+    test_prism_boundary_condition_converges_at_the_expected_order is. The dS
+    exactness tests run at 2 and 3 ranks. Degree 3 uses the first two meshes
+    only: the DG3 solve on the finest mesh takes more than 7 minutes.
+    """
+    meshnames = SCRAMBLED_ORDER_MESHNAMES[:2] if degree == 3 else SCRAMBLED_ORDER_MESHNAMES
+    steps = [_sipg_order_step(name, degree) for name in meshnames]
+    for (h0, l2_0, h1_0), (h1, l2_1, h1_1) in zip(steps[:-1], steps[1:]):
+        ratio = np.log(h0 / h1)
+        l2_order = np.log(l2_0 / l2_1) / ratio
+        h1_order = np.log(h1_0 / h1_1) / ratio
+        # The lower bound is the test. The upper bound catches an error that
+        # collapsed into round-off instead of converging.
+        assert degree + 1 - 0.3 < l2_order < degree + 1 + 0.5, (l2_order, steps)
+        assert degree - 0.3 < h1_order < degree + 0.5, (h1_order, steps)
+
+
+@pytest.mark.parallel([1, 2, 3])
+def test_prism_dS_compiles_to_one_kernel_per_facet_shape():
+    mesh = Mesh(str(MESHDIR / INTERIOR_MESHNAME))
+    got = {"all": _ds_integral_types(Constant(1.0) * dS(domain=mesh)),
+           "marker 10": _ds_integral_types(Constant(1.0) * dS(10, domain=mesh)),
+           "markers 10 and 20": _ds_integral_types(Constant(1.0) * dS((10, 20), domain=mesh))}
+    both = _ds_integral_types(Constant(1.0) * ds(domain=mesh) + Constant(1.0) * dS(domain=mesh))
+    for key, types in got.items():
+        assert types == ["interior_facet_quad", "interior_facet_tri"], key
+    assert both == ["exterior_facet_quad", "exterior_facet_tri",
+                    "interior_facet_quad", "interior_facet_tri"]
+
+
+@pytest.mark.parametrize("cellname", sorted(NON_PRISM_MESHES))
+def test_non_prism_dS_still_compiles_to_one_kernel(cellname):
+    make_mesh, _, _ = NON_PRISM_MESHES[cellname]
+    mesh = make_mesh()
+    assert _ds_integral_types(Constant(1.0) * dS(domain=mesh)) == ["interior_facet"]
+
+
+def test_extruded_dS_still_compiles_to_one_kernel_per_measure():
+    from firedrake import dS_h, dS_v
+
+    mesh = ExtrudedMesh(UnitSquareMesh(2, 3), 3)
+    for measure, integral_type in ((dS_v, "interior_facet_vert"),
+                                   (dS_h, "interior_facet_horiz")):
+        assert _ds_integral_types(Constant(1.0) * measure(domain=mesh)) == [integral_type]
+
+
+# The unsupported paths of a prism dS must fail with a message, and not give a
+# number. These tests are serial: each error comes before any parallel work.
+
+def test_prism_slate_interior_facet_integral_is_rejected():
+    from firedrake import Tensor
+
+    mesh = Mesh(str(MESHDIR / INTERIOR_MESHNAME))
+    V = FunctionSpace(mesh, "DG", 1)
+    u, v = TrialFunction(V), TestFunction(V)
+    # Slate turns a dS into a ds before it compiles it, so the message must
+    # name the measure of the form.
+    with pytest.raises(NotImplementedError,
+                       match="Slate does not support facet integrals on prism.*measure dS"):
+        assemble(Tensor(jump(u) * jump(v) * dS(domain=mesh)))
+
+
+def test_prism_patch_pc_with_an_interior_facet_integral_is_rejected():
+    """PatchPC rejects a dS form, as it rejects a ds form on a prism.
+
+    The error comes from a PETSc callback, so PETSc wraps it.
+    """
+    mesh = Mesh(str(MESHDIR / INTERIOR_MESHNAME))
+    V = FunctionSpace(mesh, "DG", 1)
+    u, v = TrialFunction(V), TestFunction(V)
+    n = FacetNormal(mesh)
+    a = inner(grad(u), grad(v)) * dx + 10.0 * inner(jump(u, n), jump(v, n)) * dS + u * v * dx
+    uh = Function(V)
+    parameters = {"ksp_type": "cg", "ksp_max_it": 3, "ksp_convergence_test": "skip",
+                  "pc_type": "python", "pc_python_type": "firedrake.PatchPC",
+                  "patch_pc_patch_construct_type": "star",
+                  "patch_pc_patch_construct_dim": 0,
+                  "patch_sub_ksp_type": "preonly", "patch_sub_pc_type": "lu"}
+    with pytest.raises(PETSc.Error) as error:
+        solve(a == v * dx, uh, solver_parameters=parameters)
+    assert isinstance(error.value.__cause__, NotImplementedError)
+    assert "Only for cell, interior facet, or exterior facet integrals" in str(error.value.__cause__)
+
+
+@pytest.mark.parametrize("facet", ["triangle", "quadrilateral"])
+def test_prism_dS_with_a_quadrature_rule_object_is_rejected(facet):
+    """A QuadratureRule object is for one facet shape, so a prism dS rejects it."""
+    from FIAT.reference_element import UFCQuadrilateral, UFCTriangle
+    from finat.quadrature import make_quadrature
+
+    ref = {"triangle": UFCTriangle, "quadrilateral": UFCQuadrilateral}[facet]()
+    rule = make_quadrature(ref, 1)
+    mesh = Mesh(str(MESHDIR / INTERIOR_MESHNAME))
+    with pytest.raises(NotImplementedError, match="QuadratureRule object is not supported"):
+        assemble(Constant(1.0) * dS(domain=mesh, metadata={"quadrature_rule": rule}))
+    # A degree or a scheme name is not specific to one facet shape.
+    for metadata in ({"quadrature_degree": 2}, {"quadrature_rule": "default"}):
+        got = assemble(Constant(1.0) * dS(10, domain=mesh, metadata=metadata))
+        assert np.isclose(got, 1.0, rtol=0, atol=1e-12)
+
+
+def test_prism_dS_with_a_rule_that_has_no_point_permutation_is_rejected():
+    """The canonical triangle rule of degree 4 is not symmetric, so it has no point permutation.
+
+    Without the permutation the two sides of a triangular facet do not agree
+    on the points, and the answer is wrong with no error. So the kernel must
+    fail, and the message must name the integral type, the scheme and the
+    degree.
+    """
+    mesh = Mesh(str(MESHDIR / INTERIOR_MESHNAME))
+    metadata = {"quadrature_rule": "canonical", "quadrature_degree": 4}
+    with pytest.raises(NotImplementedError) as error:
+        assemble(Constant(1.0) * dS(domain=mesh, metadata=metadata))
+    message = str(error.value)
+    for word in ("interior_facet_tri", "canonical", "4"):
+        assert word in message, message
+
+
+def _interior_subdomain_data_error(mesh, marker):
+    """The error of a dS with subdomain data, which only a cell integral supports."""
+    data = mesh.topology.interior_facets.subset(marker)
+    with pytest.raises(NotImplementedError) as error:
+        assemble(Constant(1.0) * dS(domain=mesh, subdomain_data=data))
+    return str(error.value)
+
+
+def test_prism_dS_with_subdomain_data_is_rejected_as_on_other_meshes():
+    """The subdomain data of a prism dS must not be dropped at the split."""
+    prism = _interior_subdomain_data_error(Mesh(str(MESHDIR / INTERIOR_MESHNAME)), 10)
+    tetrahedron = _interior_subdomain_data_error(UnitCubeMesh(1, 1, 1), 1)
+    assert prism == tetrahedron == "subdomain_data only supported with cell integrals"
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("meshname", SCRAMBLED_MESHNAMES)
+def test_prism_dS_scrambled_mesh_presents_every_orientation(meshname):
+    """The '-' sides of the interior facets take all 6 triangle orientations and all 4 io values.
+
+    The orientation of a quadrilateral facet is o = 4 eo + io. Without this
+    test a change in the gmsh reader could align the scrambled meshes again,
+    and every orientation test above would pass without any permutation.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    facets = mesh.topology.interior_facets
+    local_facets = facets.local_facet_dat.data_ro_with_halos.reshape(-1, 2)
+    orientations = facets.local_facet_orientation_dat.data_ro_with_halos.reshape(-1, 2)
+    # A facet in the outer halo can have one absent cell.
+    present = (facets.facet_cell != -1).all(axis=1)
+    triangle = local_facets[:, 1] >= 3
+    local = (set(int(o) for o in orientations[present & triangle, 1]),
+             set(int(o) % 4 for o in orientations[present & ~triangle, 1]))
+    # Do the collective before any assert. A rank can hold no triangular facet.
+    gathered = mesh.comm.allgather(local)
+    triangle_orientations = set().union(*(t for t, _ in gathered))
+    quadrilateral_io = set().union(*(q for _, q in gathered))
+    assert triangle_orientations == set(range(6))
+    assert quadrilateral_io == set(range(4))
