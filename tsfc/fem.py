@@ -9,7 +9,7 @@ import gem
 import numpy
 import ufl
 from FIAT.orientation_utils import Orientation as FIATOrientation
-from FIAT.reference_element import UFCHexahedron, UFCQuadrilateral, UFCSimplex, make_affine_mapping
+from FIAT.reference_element import UFCHexahedron, UFCPrism, UFCQuadrilateral, UFCSimplex, make_affine_mapping
 from FIAT.reference_element import TensorProductCell
 from finat.physically_mapped import (NeedsCoordinateMappingElement,
                                      PhysicalGeometry)
@@ -35,7 +35,7 @@ from ufl.algorithms import extract_arguments
 
 from tsfc import ufl2gem
 from tsfc.kernel_interface import ProxyKernelInterface
-from tsfc.kernel_interface.common import lower_integral_type
+from tsfc.kernel_interface.common import lower_integral_type, interior_shape_facet_types
 from tsfc.modified_terminals import (analyse_modified_terminal,
                                      construct_modified_terminal)
 from tsfc.parameters import is_complex
@@ -156,6 +156,12 @@ class ContextBase(ProxyKernelInterface):
                     return True
             return False
         if _any(UFCHexahedron, ['exterior_facet', 'interior_facet']):
+            return True
+        elif _any(UFCPrism, list(interior_shape_facet_types)):
+            # The closure of a prism keeps the PETSc cone order, as on a
+            # hexahedron, so the two sides of an interior facet see it in
+            # different orientations. The exterior shape types do not need
+            # this, because they read one side only.
             return True
         elif _any(UFCQuadrilateral, ['exterior_facet', 'interior_facet']) and _any(UFCSimplex, ['cell', 'exterior_facet', 'interior_facet']):
             return True
@@ -847,9 +853,18 @@ def _make_quad_multiindex_permuted(terminal, mt, ctx):
         raise ValueError(f"Expecting an instance of FIATOrientation : got {o}")
     eo = cell.extract_extrinsic_orientation(o)
     eo_perm_map = gem.Literal(quad_rule.extrinsic_orientation_permutation_map, dtype=gem.uint_type)
+    try:
+        io_perm_map_tuple = quad_rule.intrinsic_orientation_permutation_map_tuple
+    except ValueError as e:
+        integral_type = ctx.domain_integral_type_map[domain]
+        raise NotImplementedError(
+            f"The {integral_type} integral needs the quadrature points in the "
+            f"canonical order, but the quadrature rule on the {cell} facet has no "
+            "point permutation map. On a triangle facet only a symmetric rule "
+            "has one: use the default scheme at a degree of 50 or less.") from e
     for ref_axis in range(len(quad_multiindex)):
         io = cell.extract_intrinsic_orientation(o, ref_axis)
-        io_perm_map = gem.Literal(quad_rule.intrinsic_orientation_permutation_map_tuple[ref_axis], dtype=gem.uint_type)
+        io_perm_map = gem.Literal(io_perm_map_tuple[ref_axis], dtype=gem.uint_type)
         # Effectively swap axes if needed.
         ref_index = tuple((phys_index, gem.Indexed(eo_perm_map, (eo, ref_axis, phys_axis))) for phys_axis, phys_index in enumerate(quad_multiindex))
         quad_index_permuted = gem.VariableIndex(gem.FlexiblyIndexed(io_perm_map, ((0, ((io, 1), )), (0, ref_index))))

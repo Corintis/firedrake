@@ -3,8 +3,8 @@
 A prism has two facet shapes: three quadrilaterals (FIAT faces 0, 1 and 2) and
 two triangles (FIAT faces 3 and 4). TSFC fixes one reference facet cell and one
 quadrature rule per kernel, so one exterior facet integral becomes two
-integrals, one per shape. These tests cover the element layer only. The
-Firedrake side of the split is a later task.
+integrals, one per shape. One interior facet integral also becomes two
+integrals, one per shape. These tests cover the element layer only.
 
 The kernel selects among the entities of an integral type by POSITION in the
 list that `lower_integral_type` returns, not by FIAT entity number. For the
@@ -56,7 +56,9 @@ FACETS = [
 # ------------------------------------------------------- the integral types
 @pytest.mark.parametrize(("integral_type", "entity_ids"),
                          [("exterior_facet_tri", [3, 4]),
-                          ("exterior_facet_quad", [0, 1, 2])])
+                          ("exterior_facet_quad", [0, 1, 2]),
+                          ("interior_facet_tri", [3, 4]),
+                          ("interior_facet_quad", [0, 1, 2])])
 def test_prism_facet_integral_type(integral_type, entity_ids):
     dim, ids = lower_integral_type(PRISM, integral_type)
     assert dim == 2
@@ -87,20 +89,52 @@ def test_prism_exterior_facet_is_rejected():
     assert "more than one shape" in str(excinfo.value)
 
 
-def test_prism_interior_facet_is_not_supported():
-    """dS on a prism is out of scope. A split by facet shape does not fix it."""
-    with pytest.raises(NotImplementedError, match="not supported on prism meshes"):
+def test_prism_interior_facet_is_rejected():
+    """A plain interior facet integral on a prism must not compile.
+
+    Firedrake splits a dS on a prism into the two interior shape types. The
+    message tells a direct TSFC caller which types to use.
+    """
+    with pytest.raises(NotImplementedError) as excinfo:
         lower_integral_type(PRISM, "interior_facet")
+    assert "interior_facet_quad, interior_facet_tri" in str(excinfo.value)
+
+
+SHAPE_TYPES = ["exterior_facet_tri", "exterior_facet_quad",
+               "interior_facet_tri", "interior_facet_quad"]
 
 
 @pytest.mark.parametrize("cell", [UFCTriangle(), UFCTetrahedron(), UFCHexahedron()])
-@pytest.mark.parametrize("integral_type", ["exterior_facet_tri", "exterior_facet_quad"])
+@pytest.mark.parametrize("integral_type", SHAPE_TYPES)
 def test_shape_restricted_types_need_two_facet_shapes(cell, integral_type):
     with pytest.raises(ValueError):
         lower_integral_type(cell, integral_type)
 
 
-@pytest.mark.parametrize("integral_type", ["exterior_facet_tri", "exterior_facet_quad"])
+def test_interior_shape_types_are_not_exterior_types():
+    """The exterior facet code paths read ``shape_facet_types``.
+
+    An interior type in that dict gets a one-entry facet argument, and
+    Firedrake iterates it over the exterior facets.
+    """
+    from tsfc.kernel_interface.common import shape_facet_types, interior_shape_facet_types
+    from tsfc.kernel_interface.firedrake_loopy import exterior_facet_types, interior_facet_types
+    assert not set(interior_shape_facet_types) & set(shape_facet_types)
+    assert not set(interior_shape_facet_types) & set(exterior_facet_types)
+    assert set(interior_shape_facet_types) <= set(interior_facet_types)
+
+
+def test_interior_shape_types_are_known_to_ufl():
+    """UFL drops an integral of an unknown type, and restricts by this map."""
+    from ufl.algorithms.apply_restrictions import default_restriction_map
+    for integral_type, measure_name in (("interior_facet_tri", "dS_tri"),
+                                        ("interior_facet_quad", "dS_quad")):
+        assert integral_type in ufl.measure.integral_types()
+        assert ufl.measure.integral_type_to_measure_name[integral_type] == measure_name
+        assert default_restriction_map[integral_type] == "+"
+
+
+@pytest.mark.parametrize("integral_type", SHAPE_TYPES)
 def test_shape_restricted_types_reject_a_tensor_product_cell(integral_type):
     """An extruded cell separates its facets by direction, not by shape.
 
@@ -316,3 +350,80 @@ def test_prism_facet_normal_points_outward():
             for position in range(len(entity_ids)):
                 total[component] += _run(function, names, REF, position)
     assert np.allclose(total, 0.0, atol=1e-12)
+
+
+# ------------------------------------------------ the interior facet kernels
+def _interior_jump_form(integral_type, metadata=None):
+    """Return |x('+') - x('-')|**2 on one interior shape type."""
+    mesh = _prism_mesh()
+    x = ufl.SpatialCoordinate(mesh)
+    return ufl.inner(x('+') - x('-'), x('+') - x('-')) \
+        * ufl.Measure(integral_type, domain=mesh, metadata=metadata or {})
+
+
+@pytest.mark.parametrize("integral_type", ["interior_facet_tri", "interior_facet_quad"])
+def test_prism_interior_facet_kernel_signature(integral_type):
+    """The kernel takes two facet positions and two facet orientations.
+
+    The two sides see the facet in different orientations, so the kernel
+    permutes the quadrature points of each side with its own orientation.
+    Without the orientation argument the permutation is not in the kernel.
+    """
+    kernel, = tsfc.compile_form(_interior_jump_form(integral_type),
+                                parameters={"mode": "spectral"})
+    args = {a.name: a for a in kernel.ast.default_entrypoint.args}
+    assert list(args) == ["A", "coords_0", "facet_0", "entity_orientations_0"]
+    assert args["facet_0"].shape == (2, )
+    assert args["entity_orientations_0"].shape == (2, )
+
+
+@pytest.mark.parametrize("integral_type", ["interior_facet_tri", "interior_facet_quad"])
+def test_prism_interior_facet_kernel_reads_the_orientations(integral_type):
+    """The generated code must use both orientations, not only declare them."""
+    kernel, = tsfc.compile_form(_interior_jump_form(integral_type),
+                                parameters={"mode": "spectral"})
+    code = loopy.generate_code_v2(kernel.ast).device_code()
+    assert "entity_orientations_0[0]" in code
+    assert "entity_orientations_0[1]" in code
+
+
+def test_prism_interior_triangle_facet_needs_a_symmetric_rule():
+    """A triangle rule with no point permutation map must raise.
+
+    The "canonical" scheme is a collapsed Gauss rule. Its points are not
+    symmetric on the triangle above degree 1, so the two sides of a facet
+    cannot agree on the point order. A silent fall back to the naive order
+    gives wrong answers.
+    """
+    form = _interior_jump_form("interior_facet_tri",
+                               {"quadrature_rule": "canonical", "quadrature_degree": 2})
+    with pytest.raises(NotImplementedError) as excinfo:
+        tsfc.compile_form(form, parameters={"mode": "spectral"})
+    message = str(excinfo.value)
+    assert "interior_facet_tri" in message
+    assert "'canonical'" in message
+    assert "degree 2" in message
+
+
+def test_prism_interior_facet_canonical_scheme_on_the_quadrilaterals():
+    """A Gauss-Legendre product rule has a map, so the quadrilaterals compile."""
+    form = _interior_jump_form("interior_facet_quad",
+                               {"quadrature_rule": "canonical", "quadrature_degree": 2})
+    kernels = tsfc.compile_form(form, parameters={"mode": "spectral"})
+    assert len(kernels) == 1
+
+
+@pytest.mark.parametrize("integral_type", ["exterior_facet_tri", "exterior_facet_quad"])
+def test_prism_exterior_facet_kernel_has_no_point_permutation(integral_type):
+    """The exterior shape types read one side only, so they need no map.
+
+    This keeps the Phase B kernels unchanged. A triangle rule with no map
+    still compiles there.
+    """
+    mesh = _prism_mesh()
+    x = ufl.SpatialCoordinate(mesh)
+    form = x[0] * ufl.Measure(integral_type, domain=mesh,
+                              metadata={"quadrature_rule": "canonical", "quadrature_degree": 4})
+    kernel, = tsfc.compile_form(form, parameters={"mode": "spectral"})
+    names = [a.name for a in kernel.ast.default_entrypoint.args]
+    assert names == ["A", "coords_0", "facet_0"]

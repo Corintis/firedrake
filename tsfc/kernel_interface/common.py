@@ -14,7 +14,7 @@ import petsctools
 import numpy
 import ufl
 import ufl.algorithms.apply_restrictions
-from FIAT.reference_element import TensorProductCell, QUADRILATERAL, TRIANGLE
+from FIAT.reference_element import TensorProductCell, UFCPrism, QUADRILATERAL, TRIANGLE
 from finat.cell_tools import max_complex
 from finat.quadrature import AbstractQuadratureRule
 from gem.node import traversal
@@ -357,6 +357,17 @@ def set_quad_rule(params, cell, integral_type, functions):
         integration_dim, entity_ids = lower_integral_type(fiat_cell, integral_type)
         quad_rule = fem.get_quadrature_rule(fiat_cell, integration_dim, quadrature_degree,
                                             scheme, entity_ids[0])
+        if integral_type in interior_shape_facet_types and isinstance(fiat_cell, UFCPrism):
+            # The kernel permutes the points of each side into the canonical
+            # order (see tsfc.fem), so the rule must have a permutation map.
+            try:
+                quad_rule.intrinsic_orientation_permutation_map_tuple
+            except ValueError as e:
+                raise NotImplementedError(
+                    "The {} integral on a prism needs a quadrature rule whose "
+                    "points are symmetric on the facet, but scheme {!r} at "
+                    "degree {} is not. Use the default scheme at a degree of "
+                    "50 or less.".format(integral_type, scheme, quadrature_degree)) from e
         params["quadrature_rule"] = quad_rule
 
     if not isinstance(quad_rule, AbstractQuadratureRule):
@@ -409,6 +420,19 @@ for _integral_type, _measure_name in (('exterior_facet_tri', 'ds_tri'),
     # two entries are new keys, so no existing entry changes.
     ufl.algorithms.apply_restrictions.default_restriction_map.setdefault(_integral_type, None)
 
+# The interior facet integral types of the same cells. One ``dS`` becomes one
+# integral of each type. Do not add them to ``shape_facet_types``: the
+# exterior facet code paths read that dict.
+interior_shape_facet_types = {'interior_facet_tri': TRIANGLE,
+                              'interior_facet_quad': QUADRILATERAL}
+
+# UFL restricts the integrand of each integral type that starts with
+# "interior_facet" with this map. A missing key is a KeyError.
+for _integral_type, _measure_name in (('interior_facet_tri', 'dS_tri'),
+                                      ('interior_facet_quad', 'dS_quad')):
+    ufl.measure.register_integral_type(_integral_type, _measure_name)
+    ufl.algorithms.apply_restrictions.default_restriction_map.setdefault(_integral_type, "+")
+
 
 def facet_shape_entities(fiat_cell, integration_dim):
     """Group the subentities of one dimension by the shape of their reference cell.
@@ -446,18 +470,19 @@ def lower_integral_type(fiat_cell, integral_type):
             raise ValueError("{} integral cannot be used with a TensorProductCell; need to distinguish between vertical and horizontal contributions.".format(integral_type))
         integration_dim = dim - 1
         if len(facet_shape_entities(fiat_cell, integration_dim)) > 1 and integral_type == 'interior_facet':
-            # A split by facet shape does not help here: an interior facet
-            # integral also needs the two cells of a facet to agree on it.
             raise NotImplementedError(
-                "interior_facet integrals (dS) are not supported on prism "
-                "meshes, or on any cell whose facets have more than one shape.")
+                "interior_facet integral cannot be used with this cell; its "
+                "facets have more than one shape. Firedrake splits a dS on a "
+                "prism mesh into one integral per shape, so a direct TSFC "
+                "caller must pass one of the types {}.".format(
+                    ', '.join(sorted(interior_shape_facet_types))))
         if len(facet_shape_entities(fiat_cell, integration_dim)) > 1:
             raise ValueError(
                 "{} integral cannot be used with this cell; its facets have "
                 "more than one shape, so the integral must be split into one "
                 "integral per shape ({}).".format(
                     integral_type, ', '.join(sorted(shape_facet_types))))
-    elif integral_type in shape_facet_types:
+    elif integral_type in shape_facet_types or integral_type in interior_shape_facet_types:
         if isinstance(fiat_cell, TensorProductCell):
             raise ValueError("{} integral cannot be used with a TensorProductCell; need to distinguish between vertical and horizontal contributions.".format(integral_type))
         integration_dim = dim - 1
@@ -481,14 +506,16 @@ def lower_integral_type(fiat_cell, integral_type):
         entity_ids = [0]
     elif integral_type == 'exterior_facet_top':
         entity_ids = [1]
-    elif integral_type in shape_facet_types:
+    elif integral_type in shape_facet_types or integral_type in interior_shape_facet_types:
         groups = facet_shape_entities(fiat_cell, integration_dim)
+        facet_shape = (shape_facet_types | interior_shape_facet_types)[integral_type]
         if len(groups) == 1:
             raise ValueError(
                 "{} integral requires a cell whose facets have more than one "
-                "shape; use an exterior_facet integral with this cell.".format(integral_type))
+                "shape; use an {} integral with this cell.".format(
+                    integral_type, "interior_facet" if integral_type in interior_shape_facet_types else "exterior_facet"))
         try:
-            entity_ids = groups[shape_facet_types[integral_type]]
+            entity_ids = groups[facet_shape]
         except KeyError:
             raise ValueError(
                 "{} integral requires a cell with a facet of that shape.".format(integral_type))

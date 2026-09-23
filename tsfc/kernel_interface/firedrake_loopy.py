@@ -13,12 +13,15 @@ import loopy as lp
 
 from tsfc import kernel_args
 from finat.element_factory import as_fiat_cell, create_element
-from tsfc.kernel_interface.common import KernelBuilderBase as _KernelBuilderBase, KernelBuilderMixin, get_index_names, check_requirements, prepare_coefficient, prepare_arguments, prepare_constant, lower_integral_type, shape_facet_types
+from tsfc.kernel_interface.common import KernelBuilderBase as _KernelBuilderBase, KernelBuilderMixin, get_index_names, check_requirements, prepare_coefficient, prepare_arguments, prepare_constant, lower_integral_type, shape_facet_types, interior_shape_facet_types
 
 # Every integral type that reads one exterior facet of a cell. The two
 # shape-restricted types behave exactly like exterior_facet: the kernel takes
 # one facet number and one facet orientation.
 exterior_facet_types = ['exterior_facet', 'exterior_facet_vert'] + sorted(shape_facet_types)
+# Every integral type that reads one interior facet and its two cells. The
+# kernel takes two facet numbers and two facet orientations.
+interior_facet_types = ['interior_facet', 'interior_facet_vert'] + sorted(interior_shape_facet_types)
 from tsfc.loopy import generate as generate_loopy
 
 
@@ -342,7 +345,7 @@ class KernelBuilder(KernelBuilderBase, KernelBuilderMixin):
             if integral_type in exterior_facet_types:
                 facet = gem.Variable(f'facet_{i}', (1,), dtype=gem.uint_type)
                 self._entity_numbers[domain] = {None: gem.VariableIndex(gem.Indexed(facet, (0,))), }
-            elif integral_type in ['interior_facet', 'interior_facet_vert']:
+            elif integral_type in interior_facet_types:
                 facet = gem.Variable(f'facet_{i}', (2,), dtype=gem.uint_type)
                 self._entity_numbers[domain] = {
                     '+': gem.VariableIndex(gem.Indexed(facet, (0,))),
@@ -369,7 +372,7 @@ class KernelBuilder(KernelBuilderBase, KernelBuilderMixin):
             if integral_type in exterior_facet_types:
                 o = gem.Variable(variable_name, (1,), dtype=gem.uint_type)
                 self._entity_orientations[domain] = {None: gem.OrientationVariableIndex(gem.Indexed(o, (0,))), }
-            elif integral_type in ['interior_facet', 'interior_facet_vert']:
+            elif integral_type in interior_facet_types:
                 o = gem.Variable(variable_name, (2,), dtype=gem.uint_type)
                 self._entity_orientations[domain] = {
                     '+': gem.OrientationVariableIndex(gem.Indexed(o, (0,))),
@@ -481,7 +484,7 @@ class KernelBuilder(KernelBuilderBase, KernelBuilderMixin):
         int_dict = {}
         for domain, expr in self._entity_numbers.items():
             integral_type = info.domain_integral_type_map[domain]
-            int_dict[domain] = expr['+'].expression if integral_type in ["interior_facet", "interior_facet_vert"] else None
+            int_dict[domain] = expr['+'].expression if integral_type in interior_facet_types else None
         active_domain_numbers_interior_facets, args_ = self.make_active_domain_numbers(
             int_dict,
             active_variables,
@@ -514,7 +517,7 @@ class KernelBuilder(KernelBuilderBase, KernelBuilderMixin):
         int_dict = {}
         for domain, expr in self._entity_orientations.items():
             integral_type = info.domain_integral_type_map[domain]
-            int_dict[domain] = expr['+'].expression if integral_type in ["interior_facet", "interior_facet_vert", "interior_facet_horiz"] else None
+            int_dict[domain] = expr['+'].expression if integral_type in interior_facet_types + ["interior_facet_horiz"] else None
         active_domain_numbers_orientations_interior_facet, args_ = self.make_active_domain_numbers(
             int_dict,
             active_variables,
