@@ -35,6 +35,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from mpi4py import MPI
 
 from firedrake import (CellDiameter, Constant, DirichletBC, ExtrudedMesh,
                        FacetNormal, Function, FunctionSpace, Mesh,
@@ -2199,3 +2200,237 @@ def test_extruded_ds_still_compiles_to_one_kernel_per_measure():
         form = Constant(1.0) * measure(domain=mesh)
         assert _ds_integral_types(form) == [integral_type]
         assert np.isclose(assemble(form), area, rtol=0, atol=1e-12)
+
+
+# ------------------------------------------- Robin and Neumann conditions
+#
+# A Robin condition puts a ds term into the bilinear form, so the split of a ds
+# into one kernel per facet shape reaches the MATRIX, and not only the right
+# hand side. A split that is correct for a linear form can still be wrong for
+# a bilinear form. Each Robin problem below has no Dirichlet condition, so the
+# ds term of the matrix alone makes the system nonsingular.
+#
+# The exactness tests use a probe of total degree k in the physical
+# coordinates. The coordinate map is degree 1 on the triangle and degree 1 on
+# the interval, so each of x, y and z is in P1(triangle) x P1(interval) on
+# every prism, affine or not. The probe is therefore in the CG space of degree
+# k on prism_warped.msh too.
+
+# The vertices of each facet of prism_reference_marked.msh, by physical group.
+# A triangle is (p0, p1, p2). A parallelogram is (p0, p0 + e1, p0 + e2).
+REFERENCE_FACET_VERTICES = {
+    1: ("triangle", (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+    2: ("triangle", (0.0, 0.0, 1.0), (1.0, 0.0, 1.0), (0.0, 1.0, 1.0)),
+    3: ("parallelogram", (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    4: ("parallelogram", (0.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+    5: ("parallelogram", (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (1.0, 0.0, 1.0)),
+}
+
+# The Robin coefficient of each marker. The values are all different, so a
+# facet whose matrix entries come from the wrong marker moves the solution.
+# On prism_reference_marked.msh this does NOT detect a kernel that integrates
+# over the wrong facet of the one cell: the data are manufactured from the
+# exact solution, so they are consistent for any coefficient on any facet.
+# test_prism_ds_boundary_mass_matrix_on_each_reference_facet detects that.
+ROBIN_ALPHA_BY_MARKER = {
+    REFERENCE_MARKED_MESHNAME: {1: 1.0, 2: 2.0, 3: 3.0, 4: 4.0, 5: 5.0},
+    "prism_slab.msh": {1: 1.0, 2: 2.0, 3: 3.0},
+    MIXED_MARKER_MESHNAME: {2: 2.0, 3: 3.0, 4: 4.0},
+}
+
+
+def _planar_facet_integral(shape, points, function):
+    """Integrate a function over a planar facet, independently of Firedrake.
+
+    :arg shape: ``"triangle"`` or ``"parallelogram"``.
+    :arg points: The three points of the facet, as in REFERENCE_FACET_VERTICES.
+    :arg function: A function of a point (an array of length 3).
+    :returns: The integral. The 6 point Gauss rule on each axis, with the Duffy
+        transform on the triangle, is exact for a polynomial of degree 11.
+    """
+    p0, p1, p2 = (np.asarray(p) for p in points)
+    e1, e2 = p1 - p0, p2 - p0
+    area = np.linalg.norm(np.cross(e1, e2))
+    s, ws = _gauss(6)
+    total = 0.0
+    for i, j in itertools.product(range(6), repeat=2):
+        if shape == "triangle":
+            a, b, jac = s[i], s[j] * (1.0 - s[i]), 1.0 - s[i]
+        else:
+            a, b, jac = s[i], s[j], 1.0
+        total += ws[i] * ws[j] * jac * area * function(p0 + a * e1 + b * e2)
+    return total
+
+
+def _total_degree_exact(mesh, degree):
+    """A polynomial of total degree ``degree`` in the physical coordinates."""
+    x, y, z = SpatialCoordinate(mesh)
+    exact = 1.0 + x + 2.0 * y + 3.0 * z
+    if degree >= 2:
+        exact += x**2 + 2.0 * y**2 - z**2 + x * y - y * z + 0.5 * x * z
+    if degree >= 3:
+        exact += x * y * z + x**3 - y**2 * z + z**3
+    return exact
+
+
+def _l2_error(u, exact):
+    return float(np.sqrt(abs(assemble(inner(u - exact, u - exact) * dx))))
+
+
+@pytest.mark.parallel([1, 2, 3])
+def test_prism_ds_boundary_mass_matrix_on_each_reference_facet():
+    """f^T A g for the boundary mass matrix A of each facet, from numpy.
+
+    f and g are in the CG1 space, and their product is different on each
+    facet. A matrix entry that goes to the wrong facet, or to the wrong
+    vertex of the correct facet, changes f^T A g for at least one facet.
+    """
+    mesh = Mesh(str(MESHDIR / REFERENCE_MARKED_MESHNAME))
+    V = FunctionSpace(mesh, "CG", 1)
+    x, y, z = SpatialCoordinate(mesh)
+    f = Function(V).interpolate(1.0 + x + 2.0 * y)
+    g = Function(V).interpolate(1.0 + 4.0 * z + 3.0 * x * z)
+    u, v = TrialFunction(V), TestFunction(V)
+
+    def fg(p):
+        return (1.0 + p[0] + 2.0 * p[1]) * (1.0 + 4.0 * p[2] + 3.0 * p[0] * p[2])
+
+    for marker, (shape, *points) in REFERENCE_FACET_VERTICES.items():
+        A = assemble(inner(u, v) * ds(marker, domain=mesh)).petscmat
+        with f.dat.vec_ro as fvec, g.dat.vec_ro as gvec:
+            Ag = A.createVecLeft()
+            A.mult(gvec, Ag)
+            got = fvec.dot(Ag)
+        expected = _planar_facet_integral(shape, points, fg)
+        assert np.isclose(got, expected, rtol=0, atol=1e-12), f"facet {marker}"
+
+
+def _solve_robin(mesh, degree, exact, robin, neumann=(), dirichlet=None):
+    """Solve a Poisson problem with Robin, Neumann and Dirichlet conditions.
+
+    :arg robin: A list of pairs (alpha, measure). Each adds
+        alpha u v to the bilinear form on that measure, and the matching
+        alpha exact + grad(exact) . n to the right hand side.
+    :arg neumann: A list of measures with the Neumann condition of exact.
+    :arg dirichlet: The subdomain of the Dirichlet condition, or None.
+    :returns: The discrete solution.
+    """
+    V = FunctionSpace(mesh, "CG", degree)
+    n = FacetNormal(mesh)
+    u, v = TrialFunction(V), TestFunction(V)
+    flux = dot(grad(exact), n)
+    a = inner(grad(u), grad(v)) * dx
+    L = inner(-div(grad(exact)), v) * dx
+    for alpha, measure in robin:
+        a += alpha * inner(u, v) * measure
+        L += inner(flux + alpha * exact, v) * measure
+    for measure in neumann:
+        L += inner(flux, v) * measure
+    bcs = [] if dirichlet is None else [DirichletBC(V, exact, dirichlet)]
+    uh = Function(V)
+    solve(a == L, uh, bcs=bcs,
+          solver_parameters={"ksp_type": "preonly", "pc_type": "lu"})
+    return uh
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("degree", [1, 2, 3])
+@pytest.mark.parametrize("meshname", ["prism_slab.msh", "prism_warped.msh"])
+def test_prism_poisson_with_a_robin_condition_is_exact(meshname, degree):
+    """A Robin condition on the whole boundary, with a variable coefficient.
+
+    The plain ds holds both facet shapes, so both kernels contribute to the
+    matrix. The coefficient 1 + x^2 varies over each facet, so it must also
+    reach each kernel at the correct quadrature points.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    x, _, _ = SpatialCoordinate(mesh)
+    exact = _total_degree_exact(mesh, degree)
+    uh = _solve_robin(mesh, degree, exact, [(1.0 + x**2, ds(domain=mesh))])
+    assert _l2_error(uh, exact) < 1e-10
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("degree", [1, 2, 3])
+@pytest.mark.parametrize("meshname", sorted(ROBIN_ALPHA_BY_MARKER))
+def test_prism_robin_coefficient_on_each_marker_is_exact(meshname, degree):
+    """A Robin condition with a different coefficient on each ds(marker).
+
+    Every marker of the mesh has a Robin term, so the whole boundary is
+    covered, and there is no Dirichlet condition. On prism_slab_mixed_marker.msh
+    marker 4 holds triangles and quadrilaterals. On prism_reference_marked.msh
+    each marker is one facet of one cell.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    exact = _total_degree_exact(mesh, degree)
+    robin = [(Constant(alpha), ds(marker, domain=mesh))
+             for marker, alpha in ROBIN_ALPHA_BY_MARKER[meshname].items()]
+    uh = _solve_robin(mesh, degree, exact, robin)
+    assert _l2_error(uh, exact) < 1e-10
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("degree", [1, 2, 3])
+def test_prism_robin_on_a_marker_with_both_facet_shapes(degree):
+    """Robin on marker 4, Neumann on marker 3, Dirichlet on marker 2.
+
+    Marker 4 holds the triangles of the bottom and the quadrilaterals of the
+    side y = 0, so the Robin matrix term of ds(4) needs both kernels, each
+    over the facets of its shape in marker 4 only.
+    """
+    mesh = Mesh(str(MESHDIR / MIXED_MARKER_MESHNAME))
+    exact = _total_degree_exact(mesh, degree)
+    uh = _solve_robin(mesh, degree, exact, [(Constant(2.5), ds(4, domain=mesh))],
+                      neumann=[ds(3, domain=mesh)], dirichlet=2)
+    assert _l2_error(uh, exact) < 1e-10
+
+
+def _boundary_condition_order_step(meshname, degree, condition):
+    """Solve for a non-polynomial solution on one mesh of the order sequence.
+
+    :arg condition: ``"neumann"`` puts a Neumann condition on the bottom and
+        the sides (markers 1 and 3), so on both facet shapes, and a Dirichlet
+        condition on the top. ``"robin"`` puts a Robin condition with the
+        coefficient 1 + x^2 on the whole boundary.
+    :returns: A triple (h, L2 error, H1 seminorm error). h is the largest
+        cell diameter of the mesh, over all the processes.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    x, y, z = SpatialCoordinate(mesh)
+    exact = sin(pi * x) * cos(pi * y) * exp(z)
+    if condition == "neumann":
+        uh = _solve_robin(mesh, degree, exact, [],
+                          neumann=[ds((1, 3), domain=mesh)], dirichlet=2)
+    else:
+        uh = _solve_robin(mesh, degree, exact, [(1.0 + x**2, ds(domain=mesh))])
+    e = uh - exact
+    l2 = float(np.sqrt(abs(assemble(inner(e, e) * dx))))
+    h1 = float(np.sqrt(abs(assemble(inner(grad(e), grad(e)) * dx))))
+    diameters = Function(FunctionSpace(mesh, "DG", 0))
+    diameters.interpolate(CellDiameter(mesh))
+    h = mesh.comm.allreduce(float(diameters.dat.data_ro.max(initial=0.0)),
+                            op=MPI.MAX)
+    return h, l2, h1
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("degree", [1, 2, 3])
+@pytest.mark.parametrize("condition", ["neumann", "robin"])
+def test_prism_boundary_condition_converges_at_the_expected_order(condition, degree):
+    """The L2 error falls as h^(k+1) and the H1 seminorm error as h^k.
+
+    The meshes are warped, so the facet normal varies over each quadrilateral
+    facet and the top is not flat. The flux is the exact gradient dotted with
+    the discrete normal, so the continuous problem on each mesh has the exact
+    solution.
+    """
+    steps = [_boundary_condition_order_step(name, degree, condition)
+             for name in ORDER_MESHNAMES]
+    for (h0, l2_0, h1_0), (h1, l2_1, h1_1) in zip(steps[:-1], steps[1:]):
+        ratio = np.log(h0 / h1)
+        l2_order = np.log(l2_0 / l2_1) / ratio
+        h1_order = np.log(h1_0 / h1_1) / ratio
+        # The lower bound is the test. The upper bound catches an error that
+        # collapsed into round-off instead of converging.
+        assert degree + 1 - 0.3 < l2_order < degree + 1 + 0.5, (l2_order, steps)
+        assert degree - 0.3 < h1_order < degree + 0.5, (h1_order, steps)
