@@ -3013,19 +3013,8 @@ def test_extruded_dS_still_compiles_to_one_kernel_per_measure():
 
 # The unsupported paths of a prism dS must fail with a message, and not give a
 # number. These tests are serial: each error comes before any parallel work.
-
-def test_prism_slate_interior_facet_integral_is_rejected():
-    from firedrake import Tensor
-
-    mesh = Mesh(str(MESHDIR / INTERIOR_MESHNAME))
-    V = FunctionSpace(mesh, "DG", 1)
-    u, v = TrialFunction(V), TestFunction(V)
-    # Slate turns a dS into a ds before it compiles it, so the message must
-    # name the measure of the form.
-    with pytest.raises(NotImplementedError,
-                       match="Slate does not support facet integrals on prism.*measure dS"):
-        assemble(Tensor(jump(u) * jump(v) * dS(domain=mesh)))
-
+# The Slate and subdomain_data errors are tested in
+# test_prism_interior_facets_core.py.
 
 def test_prism_patch_pc_with_an_interior_facet_integral_is_rejected():
     """PatchPC rejects a dS form, as it rejects a ds form on a prism.
@@ -3081,21 +3070,6 @@ def test_prism_dS_with_a_rule_that_has_no_point_permutation_is_rejected():
     message = str(error.value)
     for word in ("interior_facet_tri", "canonical", "4"):
         assert word in message, message
-
-
-def _interior_subdomain_data_error(mesh, marker):
-    """The error of a dS with subdomain data, which only a cell integral supports."""
-    data = mesh.topology.interior_facets.subset(marker)
-    with pytest.raises(NotImplementedError) as error:
-        assemble(Constant(1.0) * dS(domain=mesh, subdomain_data=data))
-    return str(error.value)
-
-
-def test_prism_dS_with_subdomain_data_is_rejected_as_on_other_meshes():
-    """The subdomain data of a prism dS must not be dropped at the split."""
-    prism = _interior_subdomain_data_error(Mesh(str(MESHDIR / INTERIOR_MESHNAME)), 10)
-    tetrahedron = _interior_subdomain_data_error(UnitCubeMesh(1, 1, 1), 1)
-    assert prism == tetrahedron == "subdomain_data only supported with cell integrals"
 
 
 @pytest.mark.parallel([1, 2, 3])
