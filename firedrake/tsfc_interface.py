@@ -219,7 +219,7 @@ def compile_form(form, name, parameters=None, split=True, dont_split=(), diagona
         parameters = default_parameters["form_compiler"].copy()
         parameters.update(_)
 
-    form = _split_facet_integrals_by_shape(form)
+    form = _split_facet_integrals_by_shape(form, parameters)
 
     kernels = []
     numbering = form.terminal_numbering()
@@ -268,7 +268,7 @@ def compile_form(form, name, parameters=None, split=True, dont_split=(), diagona
     return kernels
 
 
-def _split_facet_integrals_by_shape(form):
+def _split_facet_integrals_by_shape(form, parameters):
     """Split each exterior facet integral on a cell with more than one facet shape.
 
     A prism has quadrilateral and triangular facets. TSFC compiles one kernel
@@ -276,12 +276,25 @@ def _split_facet_integrals_by_shape(form):
     with one integral of each type in ``shape_facet_types``. The integrals keep
     their subdomain id; the mesh intersects the subdomain with the facet shape.
     Integrals on every other cell are returned unchanged.
+
+    The two integrals get the same metadata. A ``QuadratureRule`` object is
+    for one reference facet only, so the other facet shape would use it too
+    and give a wrong answer. Such a rule raises ``NotImplementedError``.
     """
     integrals = []
     for integral in form.integrals():
         cell = integral.ufl_domain().ufl_cell()
         if (integral.integral_type() == "exterior_facet"
                 and isinstance(cell, ufl.Cell) and len(cell.facet_types) > 1):
+            # The integral metadata overrides the form compiler parameters,
+            # as in tsfc.driver.
+            rule = {**parameters, **integral.metadata()}.get("quadrature_rule")
+            if rule is not None and not isinstance(rule, str):
+                raise NotImplementedError(
+                    f"A QuadratureRule object is not supported for an exterior facet "
+                    f"integral (ds) on a {cell.cellname} mesh, because its facets "
+                    f"have more than one shape and a rule is for one shape only. "
+                    f"Use 'quadrature_degree' or a scheme name instead.")
             integrals.extend(integral.reconstruct(integral_type=integral_type)
                              for integral_type in sorted(shape_facet_types))
         else:

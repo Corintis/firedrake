@@ -2216,6 +2216,43 @@ def test_prism_interior_facet_integral_is_rejected():
         assemble(Constant(1.0) * dS(domain=mesh))
 
 
+@pytest.mark.parametrize("facet", ["triangle", "quadrilateral"])
+def test_prism_ds_with_a_quadrature_rule_object_is_rejected(facet):
+    """A QuadratureRule object is for one facet shape, so a prism ds rejects it.
+
+    The split gives the same metadata to the two shape kernels. Without the
+    check, a triangle rule on the quadrilateral facets gives half of their
+    area and no error.
+    """
+    from FIAT.reference_element import UFCQuadrilateral, UFCTriangle
+    from finat.quadrature import make_quadrature
+
+    ref = {"triangle": UFCTriangle, "quadrilateral": UFCQuadrilateral}[facet]()
+    rule = make_quadrature(ref, 1)
+    mesh = Mesh(str(MESHDIR / "prism_reference.msh"))
+    match = "QuadratureRule object is not supported"
+    with pytest.raises(NotImplementedError, match=match):
+        assemble(Constant(1.0) * ds(domain=mesh, metadata={"quadrature_rule": rule}))
+    with pytest.raises(NotImplementedError, match=match):
+        assemble(Constant(1.0) * ds(domain=mesh),
+                 form_compiler_parameters={"quadrature_rule": rule})
+    # A degree or a scheme name is not specific to one facet shape.
+    for metadata in ({"quadrature_degree": 2}, {"quadrature_rule": "default"}):
+        got = assemble(Constant(1.0) * ds(domain=mesh, metadata=metadata))
+        assert np.isclose(got, REFERENCE_SURFACE_AREA, rtol=0, atol=1e-12)
+
+
+def test_non_prism_ds_with_a_quadrature_rule_object_still_works():
+    """The check is for a cell with more than one facet shape only."""
+    from FIAT.reference_element import UFCTriangle
+    from finat.quadrature import make_quadrature
+
+    rule = make_quadrature(UFCTriangle(), 1)
+    got = assemble(Constant(1.0) * ds(domain=UnitCubeMesh(1, 1, 1),
+                                      metadata={"quadrature_rule": rule}))
+    assert np.isclose(got, 6.0, rtol=0, atol=1e-12)
+
+
 # The regression guard: a mesh whose facets all have one shape keeps ONE kernel
 # for one ds, with the old integral type, and the same values. The values are
 # exact: the surface area, and the divergence theorem for x . n.
