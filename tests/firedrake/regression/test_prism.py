@@ -3096,3 +3096,72 @@ def test_prism_dS_scrambled_mesh_presents_every_orientation(meshname):
     quadrilateral_io = set().union(*(q for _, q in gathered))
     assert triangle_orientations == set(range(6))
     assert quadrilateral_io == set(range(4))
+
+
+def _shell_partition(comm, meshname):
+    """A partition of prism_interior_marked*.msh that cuts along the marked planes.
+
+    :arg comm: The communicator, of size 2 or 3.
+    :arg meshname: The file name of the mesh.
+    :returns: The value of the "partition" distribution parameter: the number
+        of cells of each rank, and the cells in rank order. Rank 0 gives both;
+        the other ranks give empty arrays.
+
+    At 2 ranks the cut is the plane z = 0.5. At 3 ranks rank 0 gets z > 0.5,
+    and the cut x = 0 divides z < 0.5 between ranks 1 and 2. The cell numbers
+    are the order of the prisms in the gmsh file, as the reader keeps it.
+    """
+    coords, cells = _read_gmsh22_prisms(MESHDIR / meshname)
+    centroids = coords[cells].mean(axis=1)
+    above = centroids[:, 2] > 0.5
+    if comm.size == 2:
+        owner = np.where(above, 1, 0)
+    else:
+        owner = np.where(above, 0, np.where(centroids[:, 0] < 0.0, 1, 2))
+    if comm.rank == 0:
+        sizes = np.array([(owner == r).sum() for r in range(comm.size)], dtype=np.int32)
+        points = np.concatenate([np.flatnonzero(owner == r)
+                                 for r in range(comm.size)]).astype(np.int32)
+    else:
+        sizes = np.zeros(comm.size, dtype=np.int32)
+        points = np.empty(0, dtype=np.int32)
+    return sizes, points
+
+
+@pytest.mark.parallel([2, 3])
+@pytest.mark.parametrize("degree", [2, 3])
+def test_prism_dS_on_a_partition_boundary(degree):
+    """dS is exact on triangular and quadrilateral facets that two ranks share.
+
+    The default partitioner puts almost no triangular facet on a partition
+    boundary, so the other parallel tests do not see a triangle whose two
+    cells are on different ranks. This partition cuts along the marked
+    planes. All 136 triangles of marker 10 are on the partition boundary, and
+    at 3 ranks the 21 quadrilaterals of marker 20 below z = 0.5 are too. The
+    test asserts these counts, so that a change of the partition cannot make
+    it pass without any shared facet.
+    """
+    comm = MPI.COMM_WORLD
+    distribution = _shell_partition(comm, SCRAMBLED_INTERIOR_MESHNAME)
+    mesh = Mesh(str(MESHDIR / SCRAMBLED_INTERIOR_MESHNAME),
+                distribution_parameters={"partition": distribution})
+    facets = mesh.topology.interior_facets
+    cells = np.asarray(facets.facet_cell).reshape(-1, 2)
+    # An owned facet on the partition boundary has one owned cell and one
+    # halo cell. Each such facet is counted once, on the rank that owns it.
+    owned = np.arange(len(cells)) < facets.set.size
+    shared = owned & ((cells != -1).all(axis=1)) & ((cells < mesh.cell_set.size).sum(axis=1) == 1)
+    local = np.array([shared[facets.subset(marker).indices].sum() for marker in (10, 20)])
+    # Do the collectives before any assert.
+    on_boundary = comm.allreduce(local)
+    p = _total_degree_exact(mesh, degree)
+    u = Function(FunctionSpace(mesh, "DG", degree)).interpolate(p)
+    got = {}
+    for marker in (10, 20):
+        got[f"points, marker {marker}"] = _point_mismatch(mesh, dS(marker, domain=mesh))
+        got[f"avg, marker {marker}"] = assemble((avg(u) - p('+'))**2 * dS(marker, domain=mesh))
+        got[f"jump, marker {marker}"] = assemble(jump(u)**2 * dS(marker, domain=mesh))
+    assert on_boundary[0] == 136, on_boundary
+    assert on_boundary[1] == (21 if comm.size == 3 else 0), on_boundary
+    for key, value in got.items():
+        assert abs(value) < 1e-20, f"{key}: {value}"
