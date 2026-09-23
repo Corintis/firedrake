@@ -235,6 +235,50 @@ def _shape_facet_integral_type(integral_type, shape):
     return integral_type
 
 
+def _check_quadrilateral_submesh_halo(plex, vertex_numbering, cell_ranks):
+    """Raise if the halo of a quadrilateral submesh is not symmetric.
+
+    The orientation algorithm of a quadrilateral mesh exchanges one value for
+    each edge between an owned cell and a halo cell. Each rank must see the
+    same edges for each neighbour rank, or the exchange waits forever. A
+    submesh of co-dimension 1 has a symmetric halo only if the parent mesh
+    was distributed with a ``VERTEX`` or ``RIDGE`` overlap. The default
+    ``FACET`` overlap can give an edge that one rank shares with a halo cell
+    and the other rank does not see. This check is collective.
+
+    :arg plex: The DMPlex of the quadrilateral submesh.
+    :arg vertex_numbering: The global section of the vertex numbers.
+    :arg cell_ranks: The owner rank of each halo cell, or -1 for an owned cell.
+    """
+    comm = plex.comm.tompi4py()
+    if comm.size == 1:
+        return
+    cStart, _ = plex.getHeightStratum(0)
+    fStart, fEnd = plex.getHeightStratum(1)
+
+    def global_number(v):
+        offset = vertex_numbering.getOffset(v)
+        return offset if offset >= 0 else -(offset + 1)
+
+    shared = [[] for _ in range(comm.size)]
+    for f in range(fStart, fEnd):
+        owners = cell_ranks[plex.getSupport(f) - cStart]
+        if (owners < 0).sum() == 1 and (owners >= 0).any():
+            # As in dmcommon.get_communication_lists: one owned cell, and
+            # the owner of the halo cell is the neighbour rank.
+            edge = tuple(sorted(global_number(v) for v in plex.getCone(f)))
+            shared[owners[owners >= 0][-1]].append(edge)
+    shared = [sorted(edges) for edges in shared]
+    symmetric = comm.allreduce(shared == comm.alltoall(shared), op=MPI.LAND)
+    if not symmetric:
+        raise NotImplementedError(
+            "The halo of this quadrilateral submesh is not symmetric: two ranks "
+            "do not see the same edges between their owned and halo cells, so the "
+            "quadrilateral orientation algorithm cannot run. Distribute the parent "
+            "mesh with distribution_parameters={'overlap_type': "
+            "(DistributedMeshOverlapType.RIDGE, 1)} (or VERTEX).")
+
+
 class _Facets(object):
     """Wrapper class for facet interation information on a :func:`Mesh`
 
@@ -1596,6 +1640,8 @@ class MeshTopology(AbstractMeshTopology):
             petsctools.cite("McRae2016")
             # Quadrilateral mesh
             cell_ranks = dmcommon.get_cell_remote_ranks(plex)
+            if self.submesh_parent is not None:
+                _check_quadrilateral_submesh_halo(plex, vertex_numbering, cell_ranks)
 
             facet_orientations = dmcommon.quadrilateral_facet_orientations(
                 plex, vertex_numbering, cell_ranks)

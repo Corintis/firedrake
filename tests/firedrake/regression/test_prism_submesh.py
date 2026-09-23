@@ -20,9 +20,10 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from mpi4py import MPI
 
-from firedrake import (Constant, DirichletBC, Function, FunctionSpace, Measure,
-                       Mesh, RelabeledMesh, SpatialCoordinate, Submesh,
+from firedrake import (Constant, DirichletBC, DistributedMeshOverlapType,
+                       Function, FunctionSpace, Measure, Mesh, RelabeledMesh, SpatialCoordinate, Submesh,
                        TestFunction, TestFunctions, TrialFunction,
                        TrialFunctions, VectorFunctionSpace, assemble,
                        conditional, dS, div, ds, dx, grad, inner, jump, solve)
@@ -31,6 +32,12 @@ from firedrake.tsfc_interface import compile_form
 MESHDIR = Path(__file__).parent.parent / "meshes" / "prism"
 
 INTERIOR_MESHNAMES = ("prism_interior_marked.msh", "prism_interior_marked_scrambled.msh")
+
+# A quadrilateral submesh needs a symmetric halo in parallel, so the parent
+# needs a RIDGE (or VERTEX) overlap. With the default FACET overlap, two
+# quadrilaterals on the plane x = 0 can share an edge while their prisms
+# share no facet. See test_prism_quad_submesh_default_overlap.
+DISTRIBUTION = {"overlap_type": (DistributedMeshOverlapType.RIDGE, 1)}
 
 # The cell of the submesh on each marker, and the corners of the unit square
 # that the marked surface is, in the order of its boundary.
@@ -63,9 +70,15 @@ def _boundary_integral(f, corners):
 
 @pytest.fixture(scope="module", params=INTERIOR_MESHNAMES)
 def interior_mesh(request):
-    return Mesh(str(MESHDIR / request.param))
+    return Mesh(str(MESHDIR / request.param), distribution_parameters=DISTRIBUTION)
 
 
+def _max_abs(comm, a):
+    """The largest absolute value of a over all ranks (0 for no values)."""
+    return comm.allreduce(np.abs(a).max() if len(a) else 0.0, op=MPI.MAX)
+
+
+@pytest.mark.parallel([1, 2, 3])
 @pytest.mark.parametrize("marker", sorted(SURFACES))
 def test_prism_submesh_cell_shape(interior_mesh, marker):
     sub = Submesh(interior_mesh, 2, marker)
@@ -73,6 +86,7 @@ def test_prism_submesh_cell_shape(interior_mesh, marker):
     assert np.isclose(assemble(Constant(1.0) * dx(domain=sub)), 1.0, rtol=1e-14)
 
 
+@pytest.mark.parallel([1, 2, 3])
 @pytest.mark.parametrize("marker", sorted(SURFACES))
 def test_prism_submesh_dS_point_order(interior_mesh, marker):
     """The two cells of a submesh facet see its points in one order.
@@ -86,6 +100,7 @@ def test_prism_submesh_dS_point_order(interior_mesh, marker):
     assert assemble(inner(x('+') - x('-'), x('+') - x('-')) * dS(domain=sub)) < 1e-24
 
 
+@pytest.mark.parallel([1, 2, 3])
 @pytest.mark.parametrize("marker", sorted(SURFACES))
 def test_prism_submesh_dS_jump_of_continuous_field(interior_mesh, marker):
     """A DG3 field that interpolates a cubic has no jump on the submesh."""
@@ -95,6 +110,7 @@ def test_prism_submesh_dS_jump_of_continuous_field(interior_mesh, marker):
     assert assemble(jump(u)**2 * dS(domain=sub)) < 1e-24
 
 
+@pytest.mark.parallel([1, 2, 3])
 @pytest.mark.parametrize("marker", sorted(SURFACES))
 def test_prism_submesh_ds(interior_mesh, marker):
     """The boundary of the submesh is the boundary of the unit square."""
@@ -105,6 +121,7 @@ def test_prism_submesh_ds(interior_mesh, marker):
     assert np.isclose(assemble(_poly(SpatialCoordinate(sub)) * ds(domain=sub)), exact, rtol=1e-13)
 
 
+@pytest.mark.parallel([1, 2, 3])
 @pytest.mark.parametrize("family", ["CG", "DG"])
 @pytest.mark.parametrize("marker", sorted(SURFACES))
 def test_prism_submesh_interpolate_parent_to_submesh(interior_mesh, marker, family):
@@ -114,7 +131,7 @@ def test_prism_submesh_interpolate_parent_to_submesh(interior_mesh, marker, fami
     Vs = FunctionSpace(sub, family, 3)
     got = Function(Vs).interpolate(parent)
     exact = Function(Vs).interpolate(_poly(SpatialCoordinate(sub)))
-    assert np.abs(got.dat.data_ro - exact.dat.data_ro).max() < 1e-13
+    assert _max_abs(got.comm, got.dat.data_ro - exact.dat.data_ro) < 1e-13
 
 
 @pytest.mark.parametrize("marker", sorted(SURFACES))
@@ -136,6 +153,29 @@ def test_prism_submesh_interpolate_submesh_to_parent(interior_mesh, marker):
     assert np.abs(got.dat.data_ro[on_surface] - exact.dat.data_ro[on_surface]).max() < 1e-13
 
 
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("meshname", INTERIOR_MESHNAMES)
+def test_prism_quad_submesh_default_overlap(meshname):
+    """A quadrilateral submesh of a mesh with the default FACET overlap.
+
+    In parallel the halo of Submesh(mesh, 2, 20) is not symmetric: a rank
+    has a halo quadrilateral whose owner does not see the owned
+    quadrilateral next to it. The quadrilateral orientation algorithm then
+    waited forever. Now every rank raises NotImplementedError, or, if the
+    halo happens to be symmetric, the submesh is correct.
+    """
+    mesh = Mesh(str(MESHDIR / meshname))
+    try:
+        sub = Submesh(mesh, 2, 20)
+        sub.cell_closure
+    except NotImplementedError as e:
+        assert mesh.comm.size > 1
+        assert "RIDGE" in str(e)
+        return
+    x = SpatialCoordinate(sub)
+    assert assemble(inner(x('+') - x('-'), x('+') - x('-')) * dS(domain=sub)) < 1e-24
+
+
 def _codim0_submesh(mesh):
     """The submesh of the prisms with x < 0, and its parent with that cell marker."""
     x, _, _ = SpatialCoordinate(mesh)
@@ -144,6 +184,7 @@ def _codim0_submesh(mesh):
     return mesh, Submesh(mesh, 3, 100)
 
 
+@pytest.mark.parallel([1, 2, 3])
 def test_prism_codim0_submesh_facets(interior_mesh):
     """A codim-0 submesh of a prism mesh keeps the prism cells and the facet markers.
 
@@ -168,7 +209,7 @@ def test_prism_codim0_submesh_interpolate(interior_mesh):
     parent = Function(V).interpolate(_poly(SpatialCoordinate(mesh)))
     exact = Function(Vs).interpolate(_poly(SpatialCoordinate(sub)))
     got = Function(Vs).interpolate(parent)
-    assert np.abs(got.dat.data_ro - exact.dat.data_ro).max() < 1e-13
+    assert _max_abs(got.comm, got.dat.data_ro - exact.dat.data_ro) < 1e-13
     back = Function(V).interpolate(exact, allow_missing_dofs=True)
     assert assemble((back - parent)**2 * dx(100)) < 1e-24
 
@@ -219,6 +260,7 @@ def _restrict(u, kind, side):
     return u(side) if kind == "interior" else u
 
 
+@pytest.mark.parallel([1, 2, 3])
 @pytest.mark.parametrize("kind,marker", CROSS_CASES)
 def test_prism_cross_mesh_keeps_one_facet_shape(interior_mesh, kind, marker):
     """A facet integral coupled with a facet submesh gives one kernel.
@@ -234,6 +276,7 @@ def test_prism_cross_mesh_keeps_one_facet_shape(interior_mesh, kind, marker):
     assert sorted(k.kinfo.integral_type for k in kernels) == expected
 
 
+@pytest.mark.parallel([1, 2, 3])
 @pytest.mark.parametrize("kind,marker", CROSS_CASES)
 def test_prism_cross_mesh_facet_integral(interior_mesh, kind, marker):
     """The prism facet and the submesh cell see the points in one order.
@@ -256,6 +299,7 @@ def test_prism_cross_mesh_facet_integral(interior_mesh, kind, marker):
     assert np.isclose(assemble(Constant(1.0) * on_mesh), 1.0, rtol=1e-14)
 
 
+@pytest.mark.parallel([1, 2, 3])
 @pytest.mark.parametrize("facet,marker", [("ds", 1), ("dS", 10)])
 def test_prism_codim0_cross_mesh_facet_integral(interior_mesh, facet, marker):
     """A facet integral on a codim-0 submesh, coupled with the same facets of the parent.
@@ -276,6 +320,7 @@ def test_prism_codim0_cross_mesh_facet_integral(interior_mesh, facet, marker):
         assert np.isclose(assemble(u * us * on_sub), exact, rtol=1e-13)
 
 
+@pytest.mark.parallel([1, 2, 3])
 @pytest.mark.parametrize("kind,marker", CROSS_CASES)
 def test_prism_cross_mesh_facet_matrix(interior_mesh, kind, marker):
     """The coupling matrices map the dofs of one mesh to the other exactly.
@@ -301,14 +346,15 @@ def test_prism_cross_mesh_facet_matrix(interior_mesh, kind, marker):
             with p_mesh.dat.vec_ro as x:
                 got = B.createVecLeft()
                 B.mult(x, got)
-                assert np.abs(got.array_r - load_sub).max() < 1e-14
+                assert _max_abs(mesh.comm, got.array_r - load_sub) < 1e-14
             with p_sub.dat.vec_ro as x:
                 got = Bt.createVecLeft()
                 Bt.mult(x, got)
-                assert np.abs(got.array_r - load_mesh).max() < 1e-14
-    assert np.abs(load_sub).max() > 1e-3
+                assert _max_abs(mesh.comm, got.array_r - load_mesh) < 1e-14
+    assert _max_abs(mesh.comm, load_sub) > 1e-3
 
 
+@pytest.mark.parallel([1, 2, 3])
 @pytest.mark.parametrize("marker", [10, 20])
 def test_prism_lagrange_multiplier_interface(interior_mesh, marker):
     """Poisson problem with a Lagrange multiplier on a marked interior surface.
@@ -353,6 +399,7 @@ def _plane_distance(X, marker):
     return {10: X[2] - 0.5, 20: X[0]}[marker]
 
 
+@pytest.mark.parallel([1, 2, 3])
 def test_prism_cross_mesh_unsupported_coupling(interior_mesh):
     """A prism facet integral coupled with a prism cell integral raises."""
     mesh, sub = _codim0_submesh(interior_mesh)
