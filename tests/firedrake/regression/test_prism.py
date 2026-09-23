@@ -1,6 +1,6 @@
 """Unstructured prism meshes read from gmsh files.
 
-The meshes come from ``prism_meshes/`` at the repository root. They hold
+The meshes come from ``tests/firedrake/meshes/prism/``. They hold
 ``DM_POLYTOPE_TRI_PRISM`` cells, which is the only prism cell type that this
 code supports. Exterior facet integrals (``ds``) are tested at the end of the
 file. Interior facet integrals (``dS``) are not supported on a prism.
@@ -49,7 +49,7 @@ from firedrake import (CellDiameter, Constant, DirichletBC, ExtrudedMesh,
 from firedrake.petsc import PETSc
 
 
-MESHDIR = Path(__file__).parents[3] / "prism_meshes"
+MESHDIR = Path(__file__).parent.parent / "meshes" / "prism"
 MESHNAMES = ("prism_reference.msh", "prism_slab.msh", "prism_warped.msh",
              "prism_two_perpendicular.msh")
 
@@ -66,12 +66,6 @@ TRIANGLE_SHARING_MESHNAMES = ("prism_slab.msh", "prism_warped.msh")
 # then the cell.
 QUAD_FACE_COLUMNS = (15, 16, 17)
 TRIANGLE_FACE_COLUMNS = (18, 19)
-
-pytestmark = pytest.mark.skipif(
-    not MESHDIR.is_dir(),
-    reason=f"prism mesh directory {MESHDIR} is missing; "
-           "run prism_meshes/make_prism_mesh.py to create it",
-)
 
 
 # ------------------------------------------------------------------ helpers
@@ -1745,7 +1739,7 @@ def test_prism_mixed_vector_scalar_system_is_exact():
 #
 # The meshes are warped, so no prism is affine and the Jacobian varies inside
 # every cell. Their element size halves exactly from one level to the next;
-# see prism_meshes/make_prism_mesh.py for why that matters.
+# see tests/firedrake/meshes/prism/make_prism_mesh.py for why that matters.
 
 ORDER_MESHNAMES = ("prism_order_r0.msh", "prism_order_r1.msh",
                    "prism_order_r2.msh")
@@ -1944,7 +1938,7 @@ REFERENCE_MARKED_MESHNAME = "prism_reference_marked.msh"
 MIXED_MARKER_MESHNAME = "prism_slab_mixed_marker.msh"
 
 # The five facets of prism_reference_marked.msh, by physical group: the
-# area and the outward unit normal. See prism_meshes/make_prism_mesh.py.
+# area and the outward unit normal. See tests/firedrake/meshes/prism/make_prism_mesh.py.
 REFERENCE_FACETS = {
     1: (0.5, (0.0, 0.0, -1.0)),
     2: (0.5, (0.0, 0.0, 1.0)),

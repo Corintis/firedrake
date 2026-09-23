@@ -105,7 +105,7 @@ def test_node_classes_count_every_node_once_in_parallel(mesh_name, degree):
 
 # ------------------------------------- the core / owned / ghost split, pinned
 
-PRISM_MESH = Path(__file__).parents[3] / "prism_meshes" / "prism_slab.msh"
+PRISM_MESH = Path(__file__).parent.parent / "meshes" / "prism" / "prism_slab.msh"
 
 
 def _stratum_points(topology):
@@ -188,7 +188,6 @@ def test_entity_classes_per_stratum_match_the_plex(mesh_name):
     _check_the_split(MESH_MAKERS[mesh_name]().topology)
 
 
-@pytest.mark.skipif(not PRISM_MESH.exists(), reason="no prism mesh in the tree")
 @pytest.mark.parallel([2, 3])
 def test_entity_classes_per_stratum_on_a_split_dimension():
     """The prism mesh is the case the per-stratum split exists for.
@@ -284,7 +283,6 @@ def test_node_classes_split_matches_the_plex(mesh_name, degree):
     _check_the_node_split(MESH_MAKERS[mesh_name](), degree)
 
 
-@pytest.mark.skipif(not PRISM_MESH.exists(), reason="no prism mesh in the tree")
 @pytest.mark.parallel([2, 3])
 @pytest.mark.parametrize("degree", [1, 2, 3, 4])
 def test_node_classes_split_on_a_split_dimension(degree):

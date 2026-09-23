@@ -1,7 +1,7 @@
 #!/usr/bin/env python
-"""Generate gmsh prism meshes for the Firedrake prism smoke test.
+"""Generate the gmsh prism meshes for the Firedrake prism tests.
 
-Produces eight files in this directory:
+Produces nine files in this directory:
 
   prism_reference.msh one prism whose vertices are the FIAT reference prism.
                    Written by hand, because gmsh will not place a single prism
@@ -56,10 +56,9 @@ Physical groups of prism_reference_marked.msh:
   surface 4       x = 0,     quadrilateral, area 1
   surface 5       x + y = 1, quadrilateral, area sqrt(2)
 
-Run:  python prism_meshes/make_prism_mesh.py
+Run:  python tests/firedrake/meshes/prism/make_prism_mesh.py
 """
 import os
-import sys
 import numpy as np
 import gmsh
 
