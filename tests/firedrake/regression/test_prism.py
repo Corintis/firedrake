@@ -1633,18 +1633,22 @@ def test_prism_mixed_cell_node_map_reaches_every_dof_once(degrees):
     starts, _ = _mixed_field_offsets(W)
     lgmap = W.dof_dset.lgmap.indices
     submaps = list(W.cell_node_map())
-    # The subspace maps are the maps of the standalone spaces. The offset is
-    # not folded into them.
-    assert np.array_equal(submaps[0].values, V.cell_node_map().values)
-    assert np.array_equal(submaps[1].values, Q.cell_node_map().values)
     reached = np.concatenate([
         lgmap[starts[field] + np.unique(submaps[field].values)]
         for field in range(len(W))
     ])
+    # Do the collectives before any assert. An assert that fails on one rank
+    # only would otherwise leave the other ranks in the collective, and the
+    # run would hang in place of a failure. The first W.dim() is collective.
     gathered = np.concatenate(mesh.comm.allgather(reached))
-    assert np.unique(gathered).size == W.dim()
+    dim = W.dim()
+    # The subspace maps are the maps of the standalone spaces. The offset is
+    # not folded into them.
+    assert np.array_equal(submaps[0].values, V.cell_node_map().values)
+    assert np.array_equal(submaps[1].values, Q.cell_node_map().values)
+    assert np.unique(gathered).size == dim
     assert gathered.min() == 0
-    assert gathered.max() == W.dim() - 1
+    assert gathered.max() == dim - 1
 
 
 @pytest.mark.parallel([1, 2, 3])

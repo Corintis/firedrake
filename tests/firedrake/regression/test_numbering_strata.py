@@ -156,6 +156,11 @@ def _leaves_per_stratum(topology):
 def _check_the_split(topology):
     got = topology._entity_classes_per_stratum
     points_per_stratum = _stratum_points(topology)
+    # Do the collective before any assert. An assert that fails on one rank
+    # only would otherwise leave the other ranks in the collective, and the
+    # run would hang in place of a failure.
+    ghosts = sum(int(row[2] - row[1]) for row in got)
+    ghosts_on_all_ranks = topology.comm.allreduce(ghosts)
 
     assert np.array_equal(got, _classes_from_the_plex_labels(topology))
 
@@ -177,8 +182,7 @@ def _check_the_split(topology):
 
     # Guard against a vacuous pass: with more than one rank some stratum must
     # hold ghost points, or none of the assertions above says anything.
-    ghosts = sum(int(row[2] - row[1]) for row in got)
-    assert topology.comm.allreduce(ghosts) > 0
+    assert ghosts_on_all_ranks > 0
 
 
 @pytest.mark.parallel([2, 3])
@@ -258,18 +262,23 @@ def _check_the_node_split(mesh, degree):
     nodes_per_entity = tuple(
         topology.make_dofs_per_plex_entity(V.finat_element.entity_dofs()))
     got = tuple(int(count) for count in topology.node_classes(nodes_per_entity))
+    # Do the collectives before any assert, as in _check_the_split. The first
+    # call of V.dim() is collective too.
+    owned_on_all_ranks = mesh.comm.allreduce(got[1])
+    core_on_all_ranks = mesh.comm.allreduce(got[0])
+    dim = V.dim()
 
     assert got == _node_classes_from_the_plex(
         topology, _nodes_per_stratum(topology, nodes_per_entity))
     # The PyOP2 Set that the space is built on reports the same three numbers.
     assert got == tuple(int(size) for size in V.node_set.sizes)
-    assert mesh.comm.allreduce(got[1]) == V.dim()
+    assert owned_on_all_ranks == dim
 
     # Guard against a vacuous pass. In serial the three numbers are all V.dim(),
     # which says nothing, so every rank must see ghost nodes and some rank must
     # hold core nodes. A rank whose whole partition touches the halo has none.
     assert got[2] > got[1]
-    assert mesh.comm.allreduce(got[0]) > 0
+    assert core_on_all_ranks > 0
 
 
 @pytest.mark.parallel([2, 3])
