@@ -814,8 +814,10 @@ version, a Python loop over the cells, took 2.01 s.
 - **An RT or an HDiv product** fails with an unclear message. Measured at HEAD:
   `TensorProductElement(RT1, DG0)` gives `ValueError: Unsupported mapping:
   undefined`, and `HDiv` of that product gives a bare `AssertionError`. Both
-  errors come from UFL, before FInAT sees the element, so the guard above does
-  not apply.
+  errors come from FInAT, but not from the guard above. The RT error comes from
+  `pullback` in `finat/ufl/finiteelementbase.py`. The HDiv error comes from
+  `finat/hdivcurl.py`, through `convert_hdivelement`. Both are loud, not
+  silent. A clearer message needs a check in those two places.
   H(div) on prisms is out of scope (section 1).
 
 ### 9.3 The tests
