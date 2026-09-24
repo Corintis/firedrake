@@ -329,6 +329,17 @@ def test_prism_mixed_degree_rejects_axis_inconsistent_mesh():
         FunctionSpace(mesh, _mixed_degree_prism_element(2, 1))
 
 
+@pytest.mark.parametrize("factors", [("CG", 2, "R", 0), ("R", 0, "CG", 1)])
+def test_prism_tensor_product_with_a_real_factor_is_rejected(factors):
+    """A Real factor would build as DG0, not as one global value."""
+    base_family, base_degree, axis_family, axis_degree = factors
+    mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
+    element = TensorProductElement(FiniteElement(base_family, triangle, base_degree),
+                                   FiniteElement(axis_family, interval, axis_degree))
+    with pytest.raises(NotImplementedError, match="needs factors of the families"):
+        FunctionSpace(mesh, element)
+
+
 def test_prism_volume(meshname):
     mesh = Mesh(str(MESHDIR / meshname))
     expected = _prism_volume_from_gmsh(MESHDIR / meshname)
