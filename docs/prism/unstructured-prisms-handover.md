@@ -41,9 +41,9 @@ prism may point in its own direction — loads, assembles and solves.
 | `jump`, `avg`, `FacetNormal('±')`, `CellVolume('±')`, `CellDiameter('±')`, `FacetArea` in a `dS` integrand | works |
 | DG methods on `dS`, for example SIPG | works; DG1-3 converge at the theoretical order on non-affine, scrambled meshes |
 | Weak interface conditions on `dS(tag)`: a surface source, a contact conductance | works; exact on each facet shape |
-| `dS` on a facet submesh, `Submesh(mesh, 2, tag)` (its interior edges) | works (C7). Before C7 it gave a wrong answer with no error |
-| An integral over a prism mesh and its facet submesh: `dS(tag)` or `ds(tag)` on the prism mesh with `dx` on the submesh, in either direction (C8) | works in serial; a Lagrange multiplier on an interior surface gives the exact solution |
-| The same C7 and C8 tests in parallel | **pending** |
+| `dS` on a facet submesh, `Submesh(mesh, 2, tag)` (its interior edges) | works (C7), in serial and at 2 and 3 ranks. Before C7 it gave a wrong answer with no error. In parallel, a quadrilateral submesh needs a `RIDGE` or `VERTEX` overlap of the parent (section 8.3) |
+| An integral over a prism mesh and its facet submesh: `dS(tag)` or `ds(tag)` on the prism mesh with `dx` on the submesh, in either direction (C8) | works in serial and at 2 and 3 ranks; a Lagrange multiplier on an interior surface gives the exact solution |
+| Interpolation from a submesh to its parent in parallel | not tested; the forward interpolation of a CG space from a submesh to its parent can be wrong in parallel. This is a pre-existing Firedrake defect (issue 4483, section 8.3) |
 | `ds` or `dS` with a `QuadratureRule` object in the metadata or the form compiler parameters | `NotImplementedError` from `_split_facet_integrals_by_shape`; use `quadrature_degree` or a scheme name. A C8 coupling that keeps one facet shape accepts the object |
 | `dS` with a triangle rule that has no point permutation (`"quadrature_rule": "canonical"` at degree 2 or more, or the default rule above degree 50) | `NotImplementedError` from `set_quad_rule`, which names the integral type, the scheme and the degree |
 | `ds(subdomain_data=...)`, `dS(subdomain_data=...)` | the same `NotImplementedError` as on the other meshes |
@@ -52,6 +52,8 @@ prism may point in its own direction — loads, assembles and solves.
 | `MinFacetEdgeLength` on a prism | `Exception: Cell type prism not supported.` (not a Phase C change; no test) |
 | A facet integral on a prism mesh coupled with `dx` of a prism submesh (codim 0) | `NotImplementedError` ("more than one shape"). Integrate on the submesh instead (section 8.3) |
 | A cross-mesh measure on the parent with no tag | **a wrong answer with no error**, pre-existing on all cells (section 8.3) |
+| A mixed-degree prism element, `TensorProductElement(triangle element, interval element)`, for example P2 x P1 | works on an axis-consistent mesh, at 1, 2 and 3 ranks (section 9). The design document (its scope table and section 6.2) made separate base and axis degrees "analysis only" |
+| A mixed-degree element on a mesh that is not axis-consistent | `NotImplementedError` on all ranks (section 9) |
 | H(div)/H(curl) on prisms, mixed tet/prism meshes | out of scope |
 
 **Read the mixed-space row as qualified, because it is.** Prism mixed spaces
@@ -170,7 +172,9 @@ mixed-cell tests pass (Step 1 of the end-of-branch run: `tests/firedrake/submesh
 cell now raises `NotImplementedError`.
 
 On the per-stratum path, `make_dofs_per_plex_entity` raises `NotImplementedError`
-when an element gives the entities of one polytope type different dof counts. This
+when an element gives the entities of one polytope type different dof counts. The
+prism edges are the exception: since `3d4a93574` they take one count for each
+edge role, axis or base (section 9). This
 check is new for a dimension that has one polytope type. Before it, the count of
 entity 0 went to the whole stratum with no error, and "HDiv Trace" 0 on a prism gave
 a space of dimension 0.
@@ -366,7 +370,15 @@ submesh       387 passed, 0 failed
 ```
 
 The output, multigrid, slate and regression suites were not run. One full run
-after Phase C replaces these numbers. That run is **pending**. The earlier counts (17 regression failures at
+after Phase C replaces these numbers. That run is **pending**.
+
+One partial result comes before it. The `tests/firedrake/submesh` suite ran in
+parallel on a snapshot of `a3e55ab08` (after C8): 376 passed and 3 `F`. Each `F`
+is a sampled at-exit teardown deadlock after the body passed. The run stopped at
+test 380, a 6-rank test that did live work on a loaded machine. So about 7 tests
+did not run. The full run covers them.
+
+The earlier counts (17 regression failures at
 the base, 15 on the branch) come from before Tasks 7 to 9 and are not current.
 
 ---
@@ -551,7 +563,8 @@ prism `ds`, `dS` and `dx` on one mesh) is byte-identical before and after C8.
 
 ### 8.3 The limits
 
-Each limit is an explicit error, except the last one.
+Each limit is an explicit error, except the interpolation from a submesh to
+its parent and the last one.
 
 - **Slate** with a `ds` or `dS` on a prism: `NotImplementedError` from
   `firedrake/slate/slac/kernel_builder.py`. The message names prisms, the integral
@@ -579,6 +592,26 @@ Each limit is an explicit error, except the last one.
   `NotImplementedError` ("more than one shape"). Integrate on the submesh
   instead, for example
   `Measure("ds", sub, intersect_measures=(Measure("ds", mesh),))`.
+- **A quadrilateral submesh in parallel with the default `FACET` overlap**:
+  `NotImplementedError` on every rank, from `_check_quadrilateral_submesh_halo`
+  (`firedrake/mesh.py`, commit `72db2f225`). Load the parent with a `RIDGE` (or
+  `VERTEX`) overlap, for example
+  `distribution_parameters={"overlap_type": (DistributedMeshOverlapType.RIDGE, 1)}`.
+  With `RIDGE` the submesh is correct. This is a generic Firedrake limit, not a
+  prism defect. The quadrilateral orientation algorithm exchanges one value for
+  each edge between an owned cell and a halo cell, so the two ranks must list the
+  same edges. With a `FACET` overlap, two quadrilaterals on the plane `x = 0` share
+  an edge, but their prisms share no facet. So one rank sees the halo cell of the
+  other rank, and the other rank does not. Before the check, `Submesh(mesh, 2, 20)`
+  waited forever at 2 and 3 ranks in `dmcommon.quadrilateral_facet_orientations`.
+  The hexahedron mesh of `test_submesh_facet_corner_case_1` with a `FACET` overlap
+  waits at the same place on main (`458649bba`). The `Submesh` docstring already
+  asks for a `VERTEX` or `RIDGE` overlap for a codim-1 submesh. A triangle submesh
+  does not need the exchange, so it works with the default overlap.
+- **The interpolation from a submesh to its parent in parallel**: a CG space can
+  get wrong values (3.8e-4 in place of 0 for a codim-0 prism submesh at 3 ranks).
+  The value is the same before Phase C. This is Firedrake issue 4483. The tests of
+  this path stay serial (section 8.5).
 - **MATIS mixed assembly**: broken, pre-existing, on all cells (section 1).
 - **An untagged cross-mesh measure on the parent: a silent wrong answer.**
   `dS(parent, intersect_measures=(dx(sub),))` with no tag reads the map value -1
@@ -646,8 +679,9 @@ of these tests fails (in-memory patches, one fresh kernel cache for each run).
 ### 8.5 The parallel evidence
 
 The parallel evidence comes from direct `mpiexec` drivers, not from pytest
-(section 6). The code was a `git archive` snapshot of `b52574371`, with fiat
-`a6979469`. That is the code of C7, before C8.
+(section 6). The code was a `git archive` snapshot, with fiat `a6979469`. The
+`dS` rows used `b52574371` (the code of C7, before C8). The submesh rows used
+`72db2f225` (C8 and the halo check of section 8.3).
 
 | Evidence | Scope | Result |
 |---|---|---|
@@ -655,13 +689,22 @@ The parallel evidence comes from direct `mpiexec` drivers, not from pytest
 | Rank independence: 6 meshes, the default partitioner at 1, 2 and 3 ranks, a shell partition at 2 and 3 ranks | the facet number and the orientation of each side, the vertex order of each cell, the areas, the point and jump checks, and a DG2 matrix and solve | the facet data is identical at 1, 2 and 3 ranks; the largest relative difference of a functional is 7.9e-13 |
 | Mutations at 3 ranks | the orientation of `'-'` replaced by that of `'+'`; the triangle permutation removed | 25 of 57 cases fail; the functionals change by about 1e-2 |
 | `test_prism_dS_on_a_partition_boundary` (`8b6155581`) | degrees 2 and 3 | pass at 2 and at 3 ranks; fails at 3 ranks with the triangle permutation removed |
-| The C7 and C8 tests (`test_prism_submesh.py`) in parallel | | **pending** |
-| The whole `tests/firedrake/submesh` suite in parallel after C8 (327 parallel-only tests) | | **pending** |
+| The 13 `parallel([1, 2, 3])` functions of `test_prism_submesh.py` (C7 and C8) | 62 cases, the default and the shell partition | pass at 1, 2 and 3 ranks with both partitions |
+| Rank independence of C7 and C8 | 138 values for each mesh: the submesh `dS` and `ds` checks, the interpolation errors, the cross-mesh integrals and matrices, the Lagrange multiplier solution | the largest relative difference is 1.1e-13; the values that are exactly 0 stay below 1.4e-12 |
+| A mutation at 3 ranks, shell partition | no point permutation on the submesh cell | 18 of 62 cases fail (15 of 62 in serial) |
+| The `tests/firedrake/submesh` suite at `a3e55ab08` | the run stopped at test 380; about 7 tests did not run | 376 passed, 3 `F`; each `F` is a sampled teardown deadlock after the body passed (section 6) |
 
 Not covered in parallel: `test_prism_dS_sipg_converges_at_the_expected_order`
 (serial by design), and the error tests (serial; an error does not depend on the
-partition). `test_prism_interior_facets_core.py` and `test_prism_submesh.py` have
-no parallel mark.
+partition). `test_prism_interior_facets_core.py` has no parallel mark. At
+`fa080182b`, two functions of `test_prism_submesh.py` are serial:
+
+- `test_prism_submesh_interpolate_submesh_to_parent`. Its asserts read the local
+  array only, so a rank with no surface dof fails. The values are correct: the
+  error on the surface dofs is at most 8.9e-16 in all parallel runs.
+- `test_prism_codim0_submesh_interpolate`. At 3 ranks with the shell partition
+  the value is wrong (3.8e-4, exact 0). The value is the same on `6873b3278`,
+  before Phase C. So it is not a Phase C defect (Firedrake issue 4483).
 
 ### 8.6 How to run the Phase C tests
 
@@ -699,3 +742,89 @@ they pass. So call the test bodies from a direct driver:
 - Start it with `mpiexec -n 2 python -u driver.py`, then with `-n 3`. Run one MPI
   job at a time. Kill a stuck job by the name of its script only, never with
   `pkill -f prterun`.
+
+---
+
+## 9. Mixed-degree prism elements
+
+A prism element can now have one degree on the triangle and a different degree on
+the axis, for example P2 x P1:
+
+```python
+from finat.ufl import FiniteElement, TensorProductElement
+element = TensorProductElement(FiniteElement("CG", triangle, 2),
+                               FiniteElement("CG", interval, 1))
+V = FunctionSpace(prism_mesh, element)
+```
+
+The design document made separate base and axis degrees "analysis only" (its
+scope table and section 6.2). They now work on an unstructured prism mesh that is
+axis-consistent. Commits: fiat `4d67fe02`; here `3d4a93574`, `6b36e5458` and
+`fa080182b`.
+
+### 9.1 The design
+
+**FInAT.** `convert_tensorproductelement` (`finat/element_factory.py`) accepts a
+`TensorProductElement` on the unstructured `prism` cell. It wraps the product in
+`FlattenedDimensions`, as the other prism elements are.
+`FlattenedDimensions.degree` (`finat/cube.py`) is now the largest factor degree,
+so the two factors can have different degrees.
+
+**The numbering.** The 9 edges of a prism are one DMPlex polytope type. With
+different degrees, the axis edges and the base edges carry different dof counts.
+So a count for each polytope type (section 2.1) cannot hold them. The mesh gives
+each edge a role, axis or base:
+
+- `make_dofs_per_plex_entity` takes this path for a pure prism mesh when the dof
+  counts of the edges differ. It returns one count for each of the vertices, the
+  axis edges (FIAT edges 0 to 2), the base edges (FIAT edges 3 to 8), the
+  triangles, the quadrilaterals and the cell. A count that changes inside one role
+  raises `NotImplementedError`. An element with the same count on all edges keeps
+  the old path, so it does not need an axis-consistent mesh.
+- `_prism_edge_roles` reads the roles from `cell_closure`. The FIAT closure of a
+  prism holds the 3 axis edges in positions 6 to 8 and the 6 base edges in
+  positions 9 to 14. Two `np.bincount` calls give the role of every edge.
+- `_prism_mixed_degree_point_dofs` gives the dof count of every point of the
+  chart as one array. `create_section` and `node_classes` use it.
+
+**Axis consistency.** The role of an edge must be the same in all of its prisms.
+If an edge is an axis edge in one prism and a base edge in another, the element
+cannot be conforming. Then `_prism_edge_roles` raises `NotImplementedError`
+("consistent base or axis role"). An `allreduce` makes every rank raise, not only
+the rank that sees the edge. Without it, one rank did not raise at 3 ranks.
+`prism_two_perpendicular.msh` is the example of a mesh that is not
+axis-consistent. The other test meshes, which gmsh makes by extrusion, and their
+scrambled copies are axis-consistent.
+
+**Performance.** On 144 000 prisms, a P2 x P1 space builds in 0.09 s. The first
+version, a Python loop over the cells, took 2.01 s.
+
+### 9.2 The limits
+
+- **A restricted space** (`RestrictedFunctionSpace`) of a mixed-degree element:
+  `NotImplementedError` from `create_section`. Measured at HEAD.
+- **A Real factor**, for example `TensorProductElement(P2, Real)`: **no error.**
+  Measured at HEAD on `prism_slab.msh`: it builds a space of dimension 130, the
+  same dimension as P2 x DG0. The Real factor does not give one global value. The
+  Real checks in `create_section` and `node_classes` read the
+  `real_tensorproduct` flag of an extruded mesh, and this path does not set it.
+  Do not use a Real factor.
+- **An RT or an HDiv product** fails with an unclear message. Measured at HEAD:
+  `TensorProductElement(RT1, DG0)` gives `ValueError: Unsupported mapping:
+  undefined`, and `HDiv` of that product gives a bare `AssertionError`.
+  H(div) on prisms is out of scope (section 1).
+
+### 9.3 The tests
+
+In `tests/firedrake/regression/test_prism.py`:
+
+- `test_prism_p2_base_p1_axis_interpolation_and_dS`: P2 x P1 on `prism_slab.msh`
+  (dimension 195) and on `prism_interior_marked_scrambled.msh`. A field in the
+  space interpolates exactly, and the `jump(u)**2 * dS` of the interpolant is 0.
+- `test_prism_mixed_degree_rejects_axis_inconsistent_mesh`: P2 x P1 on
+  `prism_two_perpendicular.msh` raises `NotImplementedError`.
+- The dof count test asserts the edge-role counts of a product of two
+  "HDiv Trace" 0 elements, and that a count that changes inside one role raises.
+
+The first two tests have the mark `parallel([1, 2, 3])`. They pass at 1, 2 and 3
+ranks, measured with a direct driver.

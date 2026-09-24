@@ -300,3 +300,44 @@ at 2 and 3 ranks. So the parallel tests of the plan did not test a triangle whos
 two cells are on different ranks. C6 found this gap. `8b6155581` adds
 `test_prism_dS_on_a_partition_boundary`, which uses a shell partition and asserts
 that all 136 triangles of marker 10 are on the partition boundary.
+
+### 7.9 Plan R10 and 9.1 (C7): the closure change also reached a parallel hang
+
+**Plan says.** The C7 closure change can break the interpolation between the
+parent and the submesh. Test both directions of the interpolation (risk R10).
+
+**Actually.** The interpolation stayed correct. But in parallel, the new closure
+of a quadrilateral submesh runs the quadrilateral orientation algorithm, and with
+the default `FACET` overlap `Submesh(mesh, 2, 20)` waited forever at 2 and 3
+ranks. The halo of the submesh was asymmetric: rank 0 had 6 halo cells, rank 1
+had 0. The cause is a generic Firedrake limit: the hexahedron mesh of
+`test_submesh_facet_corner_case_1` with a `FACET` overlap waits at the same place
+on main (`458649bba`). `72db2f225` adds `_check_quadrilateral_submesh_halo`, a
+collective check that makes every rank raise `NotImplementedError` and asks for a
+`RIDGE` overlap. With `RIDGE` the submesh is correct. See section 8.3 of the
+handover.
+
+**Lesson.** A serial test of a closure change cannot show a parallel exchange
+defect. Run a new submesh path at 2 and 3 ranks before you close the task.
+
+---
+
+## 8. Scope table and section 6.2 — separate degrees on the base and the axis
+
+**Plan says.** "Separate degrees on the triangular base and the axis: Analysis
+only." Section 6.2 says that Firedrake has no user-facing way to set different
+degrees for each direction on an unstructured cell, and it makes that separate
+work.
+
+**Actually.** A `TensorProductElement` of a triangle element and an interval
+element on the unstructured prism cell is that user-facing way. It now works:
+fiat `4d67fe02`, and `3d4a93574`, `6b36e5458` and `fa080182b` here. The numbering
+gives each edge a role, axis or base, because the two roles carry different dof
+counts. See section 9 of the handover.
+
+**Note on section 2 above.** The axis-consistency validator stays unnecessary for
+an element with one degree. A mixed-degree element DOES need an axis-consistent
+mesh, because an edge that is an axis edge in one prism and a base edge in
+another gets two different dof counts. The numbering checks this on all ranks
+together and raises `NotImplementedError`. It does not reject a mesh for an
+element with one degree.
