@@ -134,6 +134,7 @@ def test_prism_submesh_interpolate_parent_to_submesh(interior_mesh, marker, fami
     assert _max_abs(got.comm, got.dat.data_ro - exact.dat.data_ro) < 1e-13
 
 
+@pytest.mark.parallel([1, 2, 3])
 @pytest.mark.parametrize("marker", sorted(SURFACES))
 def test_prism_submesh_interpolate_submesh_to_parent(interior_mesh, marker):
     """The parent dofs on the marked surface get the values of the submesh field.
@@ -149,8 +150,12 @@ def test_prism_submesh_interpolate_submesh_to_parent(interior_mesh, marker):
     X = Function(VectorFunctionSpace(interior_mesh, "CG", 3)).interpolate(SpatialCoordinate(interior_mesh))
     X = X.dat.data_ro
     on_surface = {10: np.abs(X[:, 2] - 0.5) < 1e-12, 20: np.abs(X[:, 0]) < 1e-12}[marker]
-    assert on_surface.sum() > 100
-    assert np.abs(got.dat.data_ro[on_surface] - exact.dat.data_ro[on_surface]).max() < 1e-13
+    # A rank can own no dof on the surface, so count and compare over all
+    # ranks, before any assert.
+    count = interior_mesh.comm.allreduce(int(on_surface.sum()), op=MPI.SUM)
+    error = _max_abs(interior_mesh.comm, got.dat.data_ro[on_surface] - exact.dat.data_ro[on_surface])
+    assert count > 100
+    assert error < 1e-13
 
 
 @pytest.mark.parallel([1, 2, 3])
@@ -202,6 +207,9 @@ def test_prism_codim0_submesh_facets(interior_mesh):
     assert assemble(jump(u)**2 * dS(domain=sub)) < 1e-24
 
 
+# Serial only: in parallel the forward interpolation from a submesh to its
+# parent can miss the ghost dofs of a continuous space, Firedrake issue 4483
+# (https://github.com/firedrakeproject/firedrake/issues/4483).
 def test_prism_codim0_submesh_interpolate(interior_mesh):
     mesh, sub = _codim0_submesh(interior_mesh)
     V = FunctionSpace(mesh, "CG", 3)
