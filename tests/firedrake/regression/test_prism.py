@@ -38,15 +38,15 @@ import pytest
 from mpi4py import MPI
 
 from firedrake import (CellDiameter, Constant, DirichletBC, ExtrudedMesh,
-                       FacetNormal, Function, FunctionSpace, Mesh,
+                       FacetNormal, FiniteElement, Function, FunctionSpace, Mesh,
                        PointNotInDomainError, PointEvaluator,
                        SpatialCoordinate, TestFunction, TestFunctions,
-                       TrialFunction, TrialFunctions, UnitCubeMesh,
+                       TensorProductElement, TrialFunction, TrialFunctions, UnitCubeMesh,
                        UnitSquareMesh, VectorFunctionSpace,
                        VertexOnlyMeshMissingPointsError, VTKFile, as_vector,
                        assemble, avg, conditional, cos, dS, div, dot, ds, ds_b,
-                       ds_t, ds_v, dx, exp, grad, gt, inner, jump, pi, sin,
-                       solve)
+                       ds_t, ds_v, dx, errornorm, exp, grad, gt, inner, interval,
+                       jump, pi, sin, solve, triangle)
 from firedrake.petsc import PETSc
 
 
@@ -286,6 +286,37 @@ def test_prism_mass_matrix_total_is_the_volume(degree):
     V = FunctionSpace(mesh, "CG", degree)
     M = assemble(inner(TrialFunction(V), TestFunction(V)) * dx).M.values
     assert np.isclose(M.sum(), 0.5, rtol=0, atol=1e-12)
+
+
+def _mixed_degree_prism_element(base_degree, axis_degree):
+    """Continuous tensor product with independently selected prism degrees."""
+    base = FiniteElement("CG", triangle, base_degree)
+    axis = FiniteElement("CG", interval, axis_degree)
+    return TensorProductElement(base, axis)
+
+
+@pytest.mark.parallel([1, 2, 3])
+@pytest.mark.parametrize("meshname", ["prism_slab.msh",
+                                      "prism_interior_marked_scrambled.msh"])
+def test_prism_p2_base_p1_axis_interpolation_and_dS(meshname):
+    """P2(triangle) x P1(interval) is conforming on axis-consistent prisms."""
+    mesh = Mesh(str(MESHDIR / meshname))
+    V = FunctionSpace(mesh, _mixed_degree_prism_element(2, 1))
+    assert V.finat_element.degree == 2
+    if meshname == "prism_slab.msh":
+        assert V.dim() == 195
+    x, y, z = SpatialCoordinate(mesh)
+    exact = (1 + x + 2 * y + x * y + x**2 - y**2) * (1 + 0.5 * z)
+    u = Function(V).interpolate(exact)
+    assert errornorm(exact, u, degree_rise=2) < 1e-11
+    assert abs(assemble(jump(u)**2 * dS(domain=mesh))) < 1e-20
+
+
+def test_prism_mixed_degree_rejects_axis_inconsistent_mesh():
+    """A shared edge cannot be a base edge in one prism and an axis in another."""
+    mesh = Mesh(str(MESHDIR / "prism_two_perpendicular.msh"))
+    with pytest.raises(NotImplementedError, match="consistent base or axis role"):
+        FunctionSpace(mesh, _mixed_degree_prism_element(2, 1))
 
 
 def test_prism_volume(meshname):

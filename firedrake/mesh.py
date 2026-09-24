@@ -132,6 +132,10 @@ _supported_embedded_cell_types_and_gdims = [('interval', 2),
 UNMARKED = -1
 """A mesh marker that selects all entities that are not explicitly marked."""
 
+_PRISM_MIXED_DEGREE = "prism_mixed_degree"
+_PRISM_AXIS_EDGE = 0
+_PRISM_BASE_EDGE = 1
+
 DEFAULT_MESH_NAME = "_".join(["firedrake", "default"])
 """The default name of the mesh."""
 
@@ -980,7 +984,115 @@ class AbstractMeshTopology(object, metaclass=abc.ABCMeta):
             a boundary condition is specified on.
         :returns: a new PETSc Section.
         """
-        return dmcommon.create_section(self, nodes_per_entity, on_base=real_tensorproduct, block_size=block_size, boundary_set=boundary_set)
+        mixed_degree_prism = (
+            isinstance(nodes_per_entity, (tuple, list))
+            and len(nodes_per_entity) > 0
+            and nodes_per_entity[0] == _PRISM_MIXED_DEGREE
+        )
+        if not mixed_degree_prism:
+            return dmcommon.create_section(
+                self,
+                nodes_per_entity,
+                on_base=real_tensorproduct,
+                block_size=block_size,
+                boundary_set=boundary_set,
+            )
+        if real_tensorproduct or boundary_set:
+            raise NotImplementedError(
+                "Mixed-degree unstructured prism sections do not yet support "
+                "Real tensor products or restricted sections"
+            )
+        counts = tuple(int(value) for value in nodes_per_entity[1:])
+        if len(counts) != 6:
+            raise ValueError("Invalid mixed-degree prism entity counts")
+        section = PETSc.Section().create(comm=self.comm)
+        pstart, pend = self.topology_dm.getChart()
+        section.setChart(pstart, pend)
+        for point in range(pstart, pend):
+            section.setDof(
+                point,
+                block_size * self._prism_mixed_degree_point_dofs(
+                    point,
+                    counts,
+                ),
+            )
+        section.setUp()
+        return section, 0
+
+    @cached_property
+    def _prism_edge_roles(self):
+        """Classify every edge of an axis-consistent pure prism mesh."""
+        if getattr(self, "dm_cell_types", ()) != (
+            PETSc.DM.PolytopeType.TRI_PRISM,
+        ):
+            return {}
+        plex = self.topology_dm
+        roles = {}
+        cell_start, cell_end = plex.getHeightStratum(0)
+        for cell in range(cell_start, cell_end):
+            faces = plex.getCone(cell)
+            triangle_faces = tuple(
+                face
+                for face in faces
+                if plex.getCellType(face) == PETSc.DM.PolytopeType.TRIANGLE
+            )
+            if len(triangle_faces) != 2:
+                raise RuntimeError("A prism must have exactly two triangular bases")
+            base_edges = {
+                int(edge)
+                for face in triangle_faces
+                for edge in plex.getCone(face)
+            }
+            all_edges = {
+                int(edge)
+                for face in faces
+                for edge in plex.getCone(face)
+            }
+            for edge in all_edges:
+                role = (
+                    _PRISM_BASE_EDGE
+                    if edge in base_edges
+                    else _PRISM_AXIS_EDGE
+                )
+                old_role = roles.setdefault(edge, role)
+                if old_role != role:
+                    raise NotImplementedError(
+                        "Mixed-degree prism elements require every shared edge "
+                        "to have a consistent base or axis role"
+                    )
+        edge_start, edge_end = plex.getDepthStratum(1)
+        if set(roles) != set(range(edge_start, edge_end)):
+            raise RuntimeError("Prism edge-role classification is incomplete")
+        return roles
+
+    def _prism_mixed_degree_point_dofs(self, point, counts):
+        """Return the mixed-degree prism dof count of one DMPlex point."""
+        vertex, axis_edge, base_edge, triangle, quadrilateral, cell = counts
+        plex = self.topology_dm
+        for dim, count in (
+            (0, vertex),
+            (1, None),
+            (2, None),
+            (3, cell),
+        ):
+            start, end = plex.getDepthStratum(dim)
+            if not start <= point < end:
+                continue
+            if dim == 1:
+                return (
+                    axis_edge
+                    if self._prism_edge_roles[point] == _PRISM_AXIS_EDGE
+                    else base_edge
+                )
+            if dim == 2:
+                polytope = plex.getCellType(point)
+                if polytope == PETSc.DM.PolytopeType.TRIANGLE:
+                    return triangle
+                if polytope == PETSc.DM.PolytopeType.QUADRILATERAL:
+                    return quadrilateral
+                raise RuntimeError("A prism facet must be a triangle or quadrilateral")
+            return count
+        raise RuntimeError(f"DMPlex point {point} is outside the mesh depth strata")
 
     @cached_property
     def _plex_polytope_types(self):
@@ -1045,6 +1157,33 @@ class AbstractMeshTopology(object, metaclass=abc.ABCMeta):
             stratum. See :meth:`make_dofs_per_plex_entity`.
         :returns: the number of nodes in each of core, owned, and ghost classes.
         """
+        if (
+            isinstance(nodes_per_entity, (tuple, list))
+            and len(nodes_per_entity) > 0
+            and nodes_per_entity[0] == _PRISM_MIXED_DEGREE
+        ):
+            if real_tensorproduct:
+                raise NotImplementedError(
+                    "Mixed-degree prism Real tensor products are unsupported"
+                )
+            counts = tuple(int(value) for value in nodes_per_entity[1:])
+            result = np.zeros(3, dtype=IntType)
+            for class_index, class_name in enumerate(
+                ("pyop2_core", "pyop2_owned", "pyop2_ghost")
+            ):
+                class_size = self.topology_dm.getStratumSize(class_name, 1)
+                points = (
+                    ()
+                    if class_size == 0
+                    else self.topology_dm.getStratumIS(class_name, 1).indices
+                )
+                result[class_index] = sum(
+                    self._prism_mixed_degree_point_dofs(int(point), counts)
+                    for point in points
+                )
+            result[1] += result[0]
+            result[2] += result[1]
+            return tuple(result)
         return tuple(np.dot(nodes_per_entity, self._entity_classes_per_stratum))
 
     def make_cell_node_list(self, global_numbering, entity_dofs, entity_permutations, offsets):
@@ -1070,6 +1209,44 @@ class AbstractMeshTopology(object, metaclass=abc.ABCMeta):
 
         :arg entity_dofs: FInAT element entity DoFs
         """
+        counts_by_dim = {
+            dim: {
+                entity: len(dofs)
+                for entity, dofs in entities.items()
+            }
+            for dim, entities in entity_dofs.items()
+        }
+        if (
+            getattr(self, "dm_cell_types", ())
+            == (PETSc.DM.PolytopeType.TRI_PRISM,)
+            and len(set(counts_by_dim[1].values())) > 1
+        ):
+            vertex_counts = set(counts_by_dim[0].values())
+            axis_counts = {counts_by_dim[1][entity] for entity in (0, 1, 2)}
+            base_counts = {counts_by_dim[1][entity] for entity in range(3, 9)}
+            quadrilateral_counts = {
+                counts_by_dim[2][entity] for entity in (0, 1, 2)
+            }
+            triangle_counts = {
+                counts_by_dim[2][entity] for entity in (3, 4)
+            }
+            cell_counts = set(counts_by_dim[3].values())
+            groups = (
+                vertex_counts,
+                axis_counts,
+                base_counts,
+                triangle_counts,
+                quadrilateral_counts,
+                cell_counts,
+            )
+            if any(len(group) != 1 for group in groups):
+                raise NotImplementedError(
+                    "Mixed-degree prism entities of one role have different dof counts"
+                )
+            return (
+                _PRISM_MIXED_DEGREE,
+                *(group.pop() for group in groups),
+            )
         polytope_types = self._plex_polytope_types
         if all(len(types) == 1 for types in polytope_types):
             return [len(entity_dofs[d][0]) for d in sorted(entity_dofs)]
