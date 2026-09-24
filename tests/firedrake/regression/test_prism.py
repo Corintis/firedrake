@@ -321,6 +321,7 @@ def test_prism_p2_base_p1_axis_interpolation_and_dS(meshname):
     assert abs(assemble(jump(u)**2 * dS(domain=mesh))) < 1e-20
 
 
+@pytest.mark.parallel([1, 2, 3])
 def test_prism_mixed_degree_rejects_axis_inconsistent_mesh():
     """A shared edge cannot be a base edge in one prism and an axis in another."""
     mesh = Mesh(str(MESHDIR / "prism_two_perpendicular.msh"))

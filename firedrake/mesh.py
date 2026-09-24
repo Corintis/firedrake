@@ -1008,91 +1008,64 @@ class AbstractMeshTopology(object, metaclass=abc.ABCMeta):
         section = PETSc.Section().create(comm=self.comm)
         pstart, pend = self.topology_dm.getChart()
         section.setChart(pstart, pend)
-        for point in range(pstart, pend):
-            section.setDof(
-                point,
-                block_size * self._prism_mixed_degree_point_dofs(
-                    point,
-                    counts,
-                ),
-            )
+        dofs = block_size * self._prism_mixed_degree_point_dofs(counts)
+        for point, ndof in zip(range(pstart, pend), dofs.tolist()):
+            section.setDof(point, ndof)
         section.setUp()
         return section, 0
 
     @cached_property
     def _prism_edge_roles(self):
-        """Classify every edge of an axis-consistent pure prism mesh."""
-        if getattr(self, "dm_cell_types", ()) != (
-            PETSc.DM.PolytopeType.TRI_PRISM,
-        ):
-            return {}
+        """Classify every edge of an axis-consistent pure prism mesh.
+
+        :returns: an array over the chart of the DMPlex. An edge holds
+            ``_PRISM_AXIS_EDGE`` or ``_PRISM_BASE_EDGE``; any other point
+            holds -1.
+
+        The FIAT closure of a prism holds the 3 axis edges in positions 6 to
+        8 and the 6 base edges in positions 9 to 14. This check is collective:
+        if one rank sees an edge that is an axis edge in one prism and a base
+        edge in another, every rank raises.
+        """
         plex = self.topology_dm
-        roles = {}
-        cell_start, cell_end = plex.getHeightStratum(0)
-        for cell in range(cell_start, cell_end):
-            faces = plex.getCone(cell)
-            triangle_faces = tuple(
-                face
-                for face in faces
-                if plex.getCellType(face) == PETSc.DM.PolytopeType.TRIANGLE
+        pstart, pend = plex.getChart()
+        roles = np.full(pend - pstart, -1, dtype=IntType)
+        closure = self.cell_closure - pstart
+        axis_hits = np.bincount(closure[:, 6:9].ravel(), minlength=pend - pstart)
+        base_hits = np.bincount(closure[:, 9:15].ravel(), minlength=pend - pstart)
+        conflict = bool(np.any((axis_hits > 0) & (base_hits > 0)))
+        if self.comm.allreduce(conflict, op=MPI.LOR):
+            raise NotImplementedError(
+                "Mixed-degree prism elements require every shared edge "
+                "to have a consistent base or axis role"
             )
-            if len(triangle_faces) != 2:
-                raise RuntimeError("A prism must have exactly two triangular bases")
-            base_edges = {
-                int(edge)
-                for face in triangle_faces
-                for edge in plex.getCone(face)
-            }
-            all_edges = {
-                int(edge)
-                for face in faces
-                for edge in plex.getCone(face)
-            }
-            for edge in all_edges:
-                role = (
-                    _PRISM_BASE_EDGE
-                    if edge in base_edges
-                    else _PRISM_AXIS_EDGE
-                )
-                old_role = roles.setdefault(edge, role)
-                if old_role != role:
-                    raise NotImplementedError(
-                        "Mixed-degree prism elements require every shared edge "
-                        "to have a consistent base or axis role"
-                    )
+        roles[axis_hits > 0] = _PRISM_AXIS_EDGE
+        roles[base_hits > 0] = _PRISM_BASE_EDGE
         edge_start, edge_end = plex.getDepthStratum(1)
-        if set(roles) != set(range(edge_start, edge_end)):
+        if np.any(roles[edge_start - pstart:edge_end - pstart] < 0):
             raise RuntimeError("Prism edge-role classification is incomplete")
         return roles
 
-    def _prism_mixed_degree_point_dofs(self, point, counts):
-        """Return the mixed-degree prism dof count of one DMPlex point."""
+    def _prism_mixed_degree_point_dofs(self, counts):
+        """Return the mixed-degree prism dof count of every DMPlex point.
+
+        :arg counts: the dof counts of a vertex, an axis edge, a base edge, a
+            triangle, a quadrilateral and a cell.
+        :returns: an array over the chart of the DMPlex.
+        """
         vertex, axis_edge, base_edge, triangle, quadrilateral, cell = counts
-        plex = self.topology_dm
-        for dim, count in (
-            (0, vertex),
-            (1, None),
-            (2, None),
-            (3, cell),
-        ):
-            start, end = plex.getDepthStratum(dim)
-            if not start <= point < end:
-                continue
-            if dim == 1:
-                return (
-                    axis_edge
-                    if self._prism_edge_roles[point] == _PRISM_AXIS_EDGE
-                    else base_edge
-                )
-            if dim == 2:
-                polytope = plex.getCellType(point)
-                if polytope == PETSc.DM.PolytopeType.TRIANGLE:
-                    return triangle
-                if polytope == PETSc.DM.PolytopeType.QUADRILATERAL:
-                    return quadrilateral
-                raise RuntimeError("A prism facet must be a triangle or quadrilateral")
-            return count
-        raise RuntimeError(f"DMPlex point {point} is outside the mesh depth strata")
+        pstart, pend = self.topology_dm.getChart()
+        roles = self._prism_edge_roles
+        # Every point is in the closure of a cell of a pure prism mesh.
+        closure = self.cell_closure - pstart
+        dofs = np.zeros(pend - pstart, dtype=IntType)
+        dofs[closure[:, 0:6]] = vertex
+        dofs[closure[:, 15:18]] = quadrilateral
+        dofs[closure[:, 18:20]] = triangle
+        dofs[closure[:, 20]] = cell
+        dofs[roles == _PRISM_AXIS_EDGE] = axis_edge
+        dofs[roles == _PRISM_BASE_EDGE] = base_edge
+        return dofs
 
     @cached_property
     def _plex_polytope_types(self):
@@ -1167,20 +1140,16 @@ class AbstractMeshTopology(object, metaclass=abc.ABCMeta):
                     "Mixed-degree prism Real tensor products are unsupported"
                 )
             counts = tuple(int(value) for value in nodes_per_entity[1:])
+            dofs = self._prism_mixed_degree_point_dofs(counts)
+            pstart, _ = self.topology_dm.getChart()
             result = np.zeros(3, dtype=IntType)
             for class_index, class_name in enumerate(
                 ("pyop2_core", "pyop2_owned", "pyop2_ghost")
             ):
-                class_size = self.topology_dm.getStratumSize(class_name, 1)
-                points = (
-                    ()
-                    if class_size == 0
-                    else self.topology_dm.getStratumIS(class_name, 1).indices
-                )
-                result[class_index] = sum(
-                    self._prism_mixed_degree_point_dofs(int(point), counts)
-                    for point in points
-                )
+                if self.topology_dm.getStratumSize(class_name, 1) == 0:
+                    continue
+                points = self.topology_dm.getStratumIS(class_name, 1).indices
+                result[class_index] = dofs[points - pstart].sum()
             result[1] += result[0]
             result[2] += result[1]
             return tuple(result)
