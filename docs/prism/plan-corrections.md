@@ -331,7 +331,8 @@ work.
 
 **Actually.** A `TensorProductElement` of a triangle element and an interval
 element on the unstructured prism cell is that user-facing way. It now works:
-fiat `4d67fe02`, and `3d4a93574`, `6b36e5458` and `fa080182b` here. The numbering
+fiat `4d67fe02` and `59e96582`, and `3d4a93574`, `6b36e5458`, `fa080182b`
+and `a37f2a335` here. The numbering
 gives each edge a role, axis or base, because the two roles carry different dof
 counts. See section 9 of the handover.
 

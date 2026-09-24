@@ -43,7 +43,7 @@ prism may point in its own direction — loads, assembles and solves.
 | Weak interface conditions on `dS(tag)`: a surface source, a contact conductance | works; exact on each facet shape |
 | `dS` on a facet submesh, `Submesh(mesh, 2, tag)` (its interior edges) | works (C7), in serial and at 2 and 3 ranks. Before C7 it gave a wrong answer with no error. In parallel, a quadrilateral submesh needs a `RIDGE` or `VERTEX` overlap of the parent (section 8.3) |
 | An integral over a prism mesh and its facet submesh: `dS(tag)` or `ds(tag)` on the prism mesh with `dx` on the submesh, in either direction (C8) | works in serial and at 2 and 3 ranks; a Lagrange multiplier on an interior surface gives the exact solution |
-| Interpolation from a submesh to its parent in parallel | not tested; the forward interpolation of a CG space from a submesh to its parent can be wrong in parallel. This is a pre-existing Firedrake defect (issue 4483, section 8.3) |
+| Interpolation from a submesh to its parent in parallel | works for a codim-1 submesh (tested at 1, 2 and 3 ranks). For a codim-0 submesh a CG space can get wrong values in parallel. This is a pre-existing Firedrake defect (issue 4483, section 8.3) |
 | `ds` or `dS` with a `QuadratureRule` object in the metadata or the form compiler parameters | `NotImplementedError` from `_split_facet_integrals_by_shape`; use `quadrature_degree` or a scheme name. A C8 coupling that keeps one facet shape accepts the object |
 | `dS` with a triangle rule that has no point permutation (`"quadrature_rule": "canonical"` at degree 2 or more, or the default rule above degree 50) | `NotImplementedError` from `set_quad_rule`, which names the integral type, the scheme and the degree |
 | `ds(subdomain_data=...)`, `dS(subdomain_data=...)` | the same `NotImplementedError` as on the other meshes |
@@ -610,8 +610,9 @@ its parent and the last one.
   does not need the exchange, so it works with the default overlap.
 - **The interpolation from a submesh to its parent in parallel**: a CG space can
   get wrong values (3.8e-4 in place of 0 for a codim-0 prism submesh at 3 ranks).
-  The value is the same before Phase C. This is Firedrake issue 4483. The tests of
-  this path stay serial (section 8.5).
+  The value is the same before Phase C. This is Firedrake issue 4483. The test of
+  the codim-0 case stays serial (section 8.5). The codim-1 case is correct in
+  parallel.
 - **MATIS mixed assembly**: broken, pre-existing, on all cells (section 1).
 - **An untagged cross-mesh measure on the parent: a silent wrong answer.**
   `dS(parent, intersect_measures=(dx(sub),))` with no tag reads the map value -1
@@ -696,13 +697,15 @@ The parallel evidence comes from direct `mpiexec` drivers, not from pytest
 
 Not covered in parallel: `test_prism_dS_sipg_converges_at_the_expected_order`
 (serial by design), and the error tests (serial; an error does not depend on the
-partition). `test_prism_interior_facets_core.py` has no parallel mark. At
-`fa080182b`, two functions of `test_prism_submesh.py` are serial:
+partition). `test_prism_interior_facets_core.py` has no parallel mark.
 
-- `test_prism_submesh_interpolate_submesh_to_parent`. Its asserts read the local
-  array only, so a rank with no surface dof fails. The values are correct: the
-  error on the surface dofs is at most 8.9e-16 in all parallel runs.
-- `test_prism_codim0_submesh_interpolate`. At 3 ranks with the shell partition
+`test_prism_submesh_interpolate_submesh_to_parent` has the mark
+`parallel([1, 2, 3])` since `20d34d044`. Its asserts are global now. It passes at
+1, 2 and 3 ranks with the default and the shell partitions. The error on the
+surface dofs is at most 8.9e-16 in all parallel runs.
+
+One function of `test_prism_submesh.py` stays serial,
+`test_prism_codim0_submesh_interpolate`. At 3 ranks with the shell partition
   the value is wrong (3.8e-4, exact 0). The value is the same on `6873b3278`,
   before Phase C. So it is not a Phase C defect (Firedrake issue 4483).
 
@@ -759,8 +762,8 @@ V = FunctionSpace(prism_mesh, element)
 
 The design document made separate base and axis degrees "analysis only" (its
 scope table and section 6.2). They now work on an unstructured prism mesh that is
-axis-consistent. Commits: fiat `4d67fe02`; here `3d4a93574`, `6b36e5458` and
-`fa080182b`.
+axis-consistent. Commits: fiat `4d67fe02` and `59e96582`; here `3d4a93574`,
+`6b36e5458`, `fa080182b` and `a37f2a335`.
 
 ### 9.1 The design
 
@@ -803,15 +806,16 @@ version, a Python loop over the cells, took 2.01 s.
 
 - **A restricted space** (`RestrictedFunctionSpace`) of a mixed-degree element:
   `NotImplementedError` from `create_section`. Measured at HEAD.
-- **A Real factor**, for example `TensorProductElement(P2, Real)`: **no error.**
-  Measured at HEAD on `prism_slab.msh`: it builds a space of dimension 130, the
-  same dimension as P2 x DG0. The Real factor does not give one global value. The
-  Real checks in `create_section` and `node_classes` read the
-  `real_tensorproduct` flag of an extruded mesh, and this path does not set it.
-  Do not use a Real factor.
+- **A factor that is not Lagrange or Discontinuous Lagrange**, for example a Real
+  factor: `NotImplementedError` ("needs factors of the families ...") from
+  `convert_tensorproductelement` (fiat `59e96582`). Before this guard,
+  `CG2 x Real` and `Real x CG1` built a P2 x DG0 space with no error, so the Real
+  factor did not give one global value.
 - **An RT or an HDiv product** fails with an unclear message. Measured at HEAD:
   `TensorProductElement(RT1, DG0)` gives `ValueError: Unsupported mapping:
-  undefined`, and `HDiv` of that product gives a bare `AssertionError`.
+  undefined`, and `HDiv` of that product gives a bare `AssertionError`. Both
+  errors come from UFL, before FInAT sees the element, so the guard above does
+  not apply.
   H(div) on prisms is out of scope (section 1).
 
 ### 9.3 The tests
@@ -823,6 +827,8 @@ In `tests/firedrake/regression/test_prism.py`:
   space interpolates exactly, and the `jump(u)**2 * dS` of the interpolant is 0.
 - `test_prism_mixed_degree_rejects_axis_inconsistent_mesh`: P2 x P1 on
   `prism_two_perpendicular.msh` raises `NotImplementedError`.
+- `test_prism_tensor_product_with_a_real_factor_is_rejected`: `CG2 x Real` and
+  `Real x CG1` raise `NotImplementedError`. This test is serial.
 - The dof count test asserts the edge-role counts of a product of two
   "HDiv Trace" 0 elements, and that a count that changes inside one role raises.
 
