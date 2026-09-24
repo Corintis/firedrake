@@ -200,13 +200,14 @@ def test_prism_supported_families_build():
 
 
 def test_prism_dof_count_that_changes_inside_one_polytope_type_is_rejected():
-    """The numbering stops on an element whose edges carry different dof counts.
+    """The numbering keeps every dof when the edge counts change by edge role.
 
-    The edges of a prism mesh have one polytope type, so they are one stratum
-    with one dof count. The product of two "HDiv Trace" 0 elements has no dof
-    on the base edges and one dof on each other edge. Built here directly, so
-    that the FInAT check of the family does not stop it first. Before the
-    check, the numbering took the count of edge 0 and dropped all 6 dofs.
+    The edges of a prism mesh have one polytope type. The product of two
+    "HDiv Trace" 0 elements has one dof on each base edge and no dof on the
+    axis edges. Built here directly, so that the FInAT check of the family
+    does not stop it first. The numbering once took the count of edge 0 and
+    dropped all 6 dofs. It now takes one count for each edge role. A count
+    that changes inside one role still raises.
     """
     import finat
     import finat.ufl
@@ -217,8 +218,16 @@ def test_prism_dof_count_that_changes_inside_one_polytope_type_is_rejected():
         finat.ufl.FiniteElement("HDiv Trace", ufl.triangle, 0),
         finat.ufl.FiniteElement("HDiv Trace", ufl.interval, 0), cell=prism_tpc)))
     mesh = Mesh(str(MESHDIR / "prism_slab.msh"))
-    with pytest.raises(NotImplementedError, match="different numbers of dofs"):
-        mesh.topology.make_dofs_per_plex_entity(element.entity_dofs())
+    entity_dofs = element.entity_dofs()
+    # (tag, vertex, axis edge, base edge, triangle, quadrilateral, cell)
+    assert tuple(mesh.topology.make_dofs_per_plex_entity(entity_dofs)) == (
+        "prism_mixed_degree", 0, 0, 1, 0, 0, 0)
+
+    changed = {dim: {entity: list(dofs) for entity, dofs in entities.items()}
+               for dim, entities in entity_dofs.items()}
+    changed[1][0] = [0, 1]    # one axis edge differs from the other axis edges
+    with pytest.raises(NotImplementedError, match="one role have different dof counts"):
+        mesh.topology.make_dofs_per_plex_entity(changed)
 
 
 # ----------------------------------------------------------- the cell closure
